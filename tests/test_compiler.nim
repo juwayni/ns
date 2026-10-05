@@ -24,10 +24,10 @@ proc testCompilerFixes() =
   """
   let fnScript = compile(src, addr vm, internStringImpl, newFunctionImpl)
   assert fnScript != nil
-  assert vm.objects.len > 0, "Compiler must register all string and function allocations into vm.objects!"
+  assert vm.objects != nil, "Compiler must register all string and function allocations into vm.objects!"
 
   freeVM(vm)
-  assert vm.objects.len == 0, "freeVM must clean up all tracked heap allocations!"
+  assert vm.objects == nil, "freeVM must clean up all tracked heap allocations!"
 
   echo "Compiler fixes verified successfully!"
 

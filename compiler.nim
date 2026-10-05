@@ -45,6 +45,8 @@ type
 
   ObjHeader* = object
     kind*: ObjKind
+    isMarked*: bool
+    next*: pointer # Linked list for GC sweep
 
   ObjString* = object
     header*: ObjHeader
@@ -133,6 +135,14 @@ type
     opPop,
     opGetLocal,
     opSetLocal,
+    opGetLocal0,
+    opGetLocal1,
+    opGetLocal2,
+    opGetLocal3,
+    opSetLocal0,
+    opSetLocal1,
+    opSetLocal2,
+    opSetLocal3,
     opDefineGlobal,
     opGetGlobal,
     opSetGlobal,
@@ -441,9 +451,17 @@ proc variable*(compiler: var Compiler, canAssign: bool) =
 
   if canAssign and compiler.match(tkAssign):
     compiler.expression()
-    compiler.emitOpAndByte(setOp, uint8(arg and 0xFF))
+    if getOp == opGetLocal and arg >= 0 and arg <= 3:
+      let fastSet = OpCode(ord(opSetLocal0) + arg)
+      compiler.emitOp(fastSet)
+    else:
+      compiler.emitOpAndByte(setOp, uint8(arg and 0xFF))
   else:
-    compiler.emitOpAndByte(getOp, uint8(arg and 0xFF))
+    if getOp == opGetLocal and arg >= 0 and arg <= 3:
+      let fastGet = OpCode(ord(opGetLocal0) + arg)
+      compiler.emitOp(fastGet)
+    else:
+      compiler.emitOpAndByte(getOp, uint8(arg and 0xFF))
 
 proc parsePrecedence*(compiler: var Compiler, precedence: Precedence) =
   compiler.advance()

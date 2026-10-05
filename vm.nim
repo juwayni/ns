@@ -1,8 +1,6 @@
-## vm.nim - High-Performance CallFrame & Stack VM for Nim Script Engine
+## vm.nim - High-Performance CallFrame, FlatTable & Mark-Sweep VM
 
 import compiler
-import std/tables
-export tables
 
 const
   FRAMES_MAX* = 64
@@ -19,22 +17,38 @@ type
     ip*: int
     slots*: int # Offset into vm.stack for local variables of this frame
 
+  Entry* = object
+    key*: ptr ObjString
+    val*: Value
+
+  FlatTable* = object
+    count*: int
+    capacityMask*: int
+    entries*: ptr UncheckedArray[Entry]
+
   VM* = object
     frames*: array[FRAMES_MAX, CallFrame]
     frameCount*: int
     stack*: array[STACK_MAX, Value]
     stackTop*: int
-    globals*: Table[string, Value]
-    strings*: Table[string, ptr ObjString] # Interned string table
-    objects*: seq[pointer] # Tracked heap objects pool for zero-leak GC deallocation
+    globals*: FlatTable
+    strings*: FlatTable
+    objects*: pointer # Head pointer for linked list of heap objects
+    grayStack*: seq[pointer]
+    bytesAllocated*: int
+    nextGC*: int
+    isCompiling*: bool
     output*: string
 
 proc initVM*(): VM =
   result.frameCount = 0
   result.stackTop = 0
-  result.globals = initTable[string, Value]()
-  result.strings = initTable[string, ptr ObjString]()
-  result.objects = @[]
+  result.globals = FlatTable()
+  result.strings = FlatTable()
+  result.objects = nil
+  result.grayStack = @[]
+  result.bytesAllocated = 0
+  result.nextGC = 1024 * 1024
   result.output = ""
 
 proc resetStack*(vm: var VM) =
@@ -80,6 +94,157 @@ proc isTruthy*(value: Value): bool =
   if isObjKind(value, objString): return asObjString(value).strVal.len > 0
   return true
 
+# FlatTable Operations
+proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr ObjString): ptr Entry =
+  var index = int(key.hash) and capacityMask
+  var tombstone: ptr Entry = nil
+  for _ in 0 .. capacityMask:
+    let entry = addr entries[index]
+    if entry.key == nil:
+      if isNil(entry.val):
+        return if tombstone != nil: tombstone else: entry
+      else:
+        if tombstone == nil: tombstone = entry
+    elif entry.key == key or (entry.key.hash == key.hash and entry.key.strVal == key.strVal):
+      return entry
+    index = (index + 1) and capacityMask
+  return if tombstone != nil: tombstone else: addr entries[0]
+
+proc tableGet*(table: ptr FlatTable, key: ptr ObjString, value: var Value): bool =
+  if table == nil or table.entries == nil or table.count == 0: return false
+  let entry = findEntry(table.entries, table.capacityMask, key)
+  if entry.key == nil: return false
+  value = entry.val
+  return true
+
+proc tableSet*(table: var FlatTable, key: ptr ObjString, value: Value): bool =
+  if table.entries == nil or table.count + 1 > (table.capacityMask + 1) * 3 div 4:
+    let newCapacity = if table.capacityMask == 0: 8 else: (table.capacityMask + 1) * 2
+    let newMask = newCapacity - 1
+    let newEntries = cast[ptr UncheckedArray[Entry]](alloc0(sizeof(Entry) * newCapacity))
+
+    table.count = 0
+    if table.entries != nil:
+      for i in 0 .. table.capacityMask:
+        let src = addr table.entries[i]
+        if src.key != nil:
+          let dest = findEntry(newEntries, newMask, src.key)
+          dest.key = src.key
+          dest.val = src.val
+          inc table.count
+      dealloc(table.entries)
+
+    table.entries = newEntries
+    table.capacityMask = newMask
+
+  let entry = findEntry(table.entries, table.capacityMask, key)
+  let isNewKey = entry.key == nil
+  if isNewKey: inc table.count
+
+  entry.key = key
+  entry.val = value
+  return isNewKey
+
+# Mark-Sweep GC
+proc markObject*(vm: var VM, objPtr: pointer) =
+  if objPtr == nil: return
+  let header = cast[ptr ObjHeader](objPtr)
+  if header.isMarked: return
+  header.isMarked = true
+  vm.grayStack.add(objPtr)
+
+proc markValue*(vm: var VM, value: Value) =
+  if isObj(value):
+    vm.markObject(asObj(value))
+
+proc blackenObject*(vm: var VM, objPtr: pointer) =
+  let header = cast[ptr ObjHeader](objPtr)
+  case header.kind
+  of objString, objNative, objUserData: discard
+  of objFunction:
+    let fn = cast[ptr ObjFunction](objPtr)
+    for constVal in fn.chunk.constants:
+      vm.markValue(constVal)
+
+proc collectGarbage*(vm: var VM) =
+  # Mark Roots
+  for i in 0 ..< vm.stackTop:
+    vm.markValue(vm.stack[i])
+
+  for i in 0 ..< vm.frameCount:
+    vm.markObject(cast[pointer](vm.frames[i].fn))
+
+  if vm.globals.entries != nil:
+    for i in 0 .. vm.globals.capacityMask:
+      let entry = addr vm.globals.entries[i]
+      if entry.key != nil:
+        vm.markObject(cast[pointer](entry.key))
+        vm.markValue(entry.val)
+
+  # Process Gray Stack
+  while vm.grayStack.len > 0:
+    let obj = vm.grayStack.pop()
+    vm.blackenObject(obj)
+
+  # Sweep Strings Table
+  if vm.strings.entries != nil:
+    for i in 0 .. vm.strings.capacityMask:
+      let entry = addr vm.strings.entries[i]
+      if entry.key != nil and not entry.key.header.isMarked:
+        entry.key = nil
+        entry.val = valBool(true) # Tombstone marker to preserve probe chain
+
+  # Sweep Objects Linked List
+  var previous: pointer = nil
+  var current = vm.objects
+
+  while current != nil:
+    let header = cast[ptr ObjHeader](current)
+    let nextObj = header.next
+    if header.isMarked:
+      header.isMarked = false # Reset mark for next GC
+      previous = current
+      current = nextObj
+    else:
+      let unreached = current
+      if previous != nil:
+        cast[ptr ObjHeader](previous).next = nextObj
+      else:
+        vm.objects = nextObj
+
+      current = nextObj
+      case header.kind
+      of objString:
+        let sObj = cast[ptr ObjString](unreached)
+        sObj.strVal = ""
+        dealloc(sObj)
+      of objFunction:
+        let fObj = cast[ptr ObjFunction](unreached)
+        fObj.name = ""
+        fObj.chunk.code = @[]
+        fObj.chunk.constants = @[]
+        fObj.chunk.lines = @[]
+        dealloc(fObj)
+      of objNative:
+        let nObj = cast[ptr ObjNative](unreached)
+        nObj.name = ""
+        dealloc(nObj)
+      of objUserData:
+        let uObj = cast[ptr ObjUserData](unreached)
+        if uObj.finalizer != nil and uObj.data != nil:
+          uObj.finalizer(uObj.data)
+        dealloc(uObj)
+
+  vm.nextGC = max(vm.bytesAllocated * 2, 1024 * 1024)
+
+proc trackObject*(vm: var VM, objPtr: pointer) =
+  let header = cast[ptr ObjHeader](objPtr)
+  header.next = vm.objects
+  vm.objects = objPtr
+  vm.bytesAllocated += sizeof(ObjHeader) + 32
+  if not vm.isCompiling and vm.bytesAllocated > vm.nextGC:
+    vm.collectGarbage()
+
 proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
   let fn = cast[ptr ObjFunction](alloc0(sizeof(ObjFunction)))
@@ -87,18 +252,28 @@ proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimc
   fn.arity = 0
   fn.name = name
   fn.chunk = Chunk(code: @[], constants: @[], lines: @[])
-  vm.objects.add(cast[pointer](fn))
+  vm[].trackObject(cast[pointer](fn))
   return fn
 
 proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
-  if vm.strings.contains(str):
-    return valObj(vm.strings[str])
+  var hash = 2166136261'u32
+  for c in str:
+    hash = hash xor uint8(c)
+    hash = hash * 16777619'u32
+
+  var tempObj = ObjString(header: ObjHeader(kind: objString), strVal: str, hash: hash)
+  if vm.strings.entries != nil:
+    let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, addr tempObj)
+    if entry.key != nil:
+      return valObj(entry.key)
+
   let obj = cast[ptr ObjString](alloc0(sizeof(ObjString)))
   obj.header = ObjHeader(kind: objString)
   obj.strVal = str
-  vm.strings[str] = obj
-  vm.objects.add(cast[pointer](obj))
+  obj.hash = hash
+  discard vm[].strings.tableSet(obj, valNil())
+  vm[].trackObject(cast[pointer](obj))
   return valObj(obj)
 
 proc registerNative*(vm: var VM, name: string, nativeProc: NativeFn) =
@@ -106,38 +281,43 @@ proc registerNative*(vm: var VM, name: string, nativeProc: NativeFn) =
   nativeObj.header = ObjHeader(kind: objNative)
   nativeObj.name = name
   nativeObj.fn = nativeProc
-  vm.objects.add(cast[pointer](nativeObj))
+  vm.trackObject(cast[pointer](nativeObj))
   let internedVal = internStringImpl(addr vm, name)
-  vm.globals[asObjString(internedVal).strVal] = valObj(nativeObj)
+  discard vm.globals.tableSet(asObjString(internedVal), valObj(nativeObj))
 
 proc freeVM*(vm: var VM) =
-  for objPtr in vm.objects:
-    if objPtr != nil:
-      let header = cast[ptr ObjHeader](objPtr)
-      case header.kind
-      of objString:
-        let sObj = cast[ptr ObjString](objPtr)
-        sObj.strVal = ""
-        dealloc(sObj)
-      of objFunction:
-        let fObj = cast[ptr ObjFunction](objPtr)
-        fObj.name = ""
-        fObj.chunk.code = @[]
-        fObj.chunk.constants = @[]
-        fObj.chunk.lines = @[]
-        dealloc(fObj)
-      of objNative:
-        let nObj = cast[ptr ObjNative](objPtr)
-        nObj.name = ""
-        dealloc(nObj)
-      of objUserData:
-        let uObj = cast[ptr ObjUserData](objPtr)
-        if uObj.finalizer != nil and uObj.data != nil:
-          uObj.finalizer(uObj.data)
-        dealloc(uObj)
-  vm.objects.setLen(0)
-  vm.strings.clear()
-  vm.globals.clear()
+  var current = vm.objects
+  while current != nil:
+    let header = cast[ptr ObjHeader](current)
+    let nextObj = header.next
+    case header.kind
+    of objString:
+      let sObj = cast[ptr ObjString](current)
+      sObj.strVal = ""
+      dealloc(sObj)
+    of objFunction:
+      let fObj = cast[ptr ObjFunction](current)
+      fObj.name = ""
+      fObj.chunk.code = @[]
+      fObj.chunk.constants = @[]
+      fObj.chunk.lines = @[]
+      dealloc(fObj)
+    of objNative:
+      let nObj = cast[ptr ObjNative](current)
+      nObj.name = ""
+      dealloc(nObj)
+    of objUserData:
+      let uObj = cast[ptr ObjUserData](current)
+      if uObj.finalizer != nil and uObj.data != nil:
+        uObj.finalizer(uObj.data)
+      dealloc(uObj)
+    current = nextObj
+
+  vm.objects = nil
+  if vm.globals.entries != nil: dealloc(vm.globals.entries)
+  if vm.strings.entries != nil: dealloc(vm.strings.entries)
+  vm.globals = FlatTable()
+  vm.strings = FlatTable()
   vm.resetStack()
 
 proc call*(vm: var VM, fn: ptr ObjFunction, argCount: int): bool =
@@ -222,23 +402,33 @@ proc run*(vm: var VM): InterpretResult =
       let slot = frame.readByte()
       vm.stack[frame.slots + int(slot)] = vm.peek(0)
 
+    of opGetLocal0..opGetLocal3:
+      let slot = int(instruction) - int(opGetLocal0)
+      vm.push(vm.stack[frame.slots + slot])
+
+    of opSetLocal0..opSetLocal3:
+      let slot = int(instruction) - int(opSetLocal0)
+      vm.stack[frame.slots + slot] = vm.peek(0)
+
     of opDefineGlobal:
-      let nameStr = frame.readString().strVal
-      vm.globals[nameStr] = vm.pop()
+      let nameObj = frame.readString()
+      discard vm.globals.tableSet(nameObj, vm.pop())
 
     of opGetGlobal:
-      let nameStr = frame.readString().strVal
-      if not vm.globals.contains(nameStr):
-        vm.runtimeError("Undefined variable '" & nameStr & "'.")
+      let nameObj = frame.readString()
+      var val: Value
+      if not tableGet(addr vm.globals, nameObj, val):
+        vm.runtimeError("Undefined variable '" & nameObj.strVal & "'.")
         return irRuntimeError
-      vm.push(vm.globals[nameStr])
+      vm.push(val)
 
     of opSetGlobal:
-      let nameStr = frame.readString().strVal
-      if not vm.globals.contains(nameStr):
-        vm.runtimeError("Undefined variable '" & nameStr & "'.")
+      let nameObj = frame.readString()
+      var val: Value
+      if not tableGet(addr vm.globals, nameObj, val):
+        vm.runtimeError("Undefined variable '" & nameObj.strVal & "'.")
         return irRuntimeError
-      vm.globals[nameStr] = vm.peek(0)
+      discard vm.globals.tableSet(nameObj, vm.peek(0))
 
     of opEqual:
       let b = vm.pop()
@@ -356,7 +546,9 @@ proc run*(vm: var VM): InterpretResult =
       frame = addr vm.frames[vm.frameCount - 1]
 
 proc interpret*(vm: var VM, source: string): InterpretResult =
+  vm.isCompiling = true
   let scriptFn = compile(source, addr vm, internStringImpl, newFunctionImpl)
+  vm.isCompiling = false
   if scriptFn == nil:
     return irCompileError
 

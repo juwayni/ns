@@ -8,7 +8,8 @@ export compiler.Value, compiler.ObjKind, compiler.isNum, compiler.isBool, compil
 
 proc runScript*(source: string): InterpretResult =
   var vm = initVM()
-  return vm.interpret(source)
+  result = vm.interpret(source)
+  freeVM(vm)
 
 proc runScriptEx*(source: string, vm: var VM): InterpretResult =
   return vm.interpret(source)
@@ -131,11 +132,10 @@ proc nativeFFILoad*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]):
   let udata = cast[ptr ObjUserData](alloc0(sizeof(ObjUserData)))
   udata.header = ObjHeader(kind: objUserData)
   udata.data = symAddr
-  vm.objects.add(cast[pointer](udata))
+  vm[].trackObject(cast[pointer](udata))
   return valObj(udata)
 
 proc nativeFFICall*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.} =
-  let vm = cast[ptr VM](vmPtr)
   if argc < 1 or not isObjKind(args[0], objUserData):
     return valNil()
 
@@ -154,8 +154,9 @@ proc nativeFFICall*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]):
       let res = cast[Fn1F](fnPtr)(asNum(args[1]))
       return valNum(res)
     elif isObjKind(args[1], objString):
+      let strVal = asObjString(args[1]).strVal
       type Fn1S = proc(s: cstring): int32 {.cdecl.}
-      let res = cast[Fn1S](fnPtr)(cstring(asObjString(args[1]).strVal))
+      let res = cast[Fn1S](fnPtr)(strVal.cstring)
       return valNum(float64(res))
   elif argc == 3:
     if isNum(args[1]) and isNum(args[2]):
@@ -188,10 +189,12 @@ proc loadStdlib*(vm: var VM) =
   vm.registerNative("ffiCall", nativeFFICall)
 
 proc callFunction*(vm: var VM, fnName: string, args: openArray[Value]): Value =
-  if not vm.globals.contains(fnName):
+  let internedVal = internStringImpl(addr vm, fnName)
+  let fnObj = asObjString(internedVal)
+  var fnVal: Value
+  if not tableGet(addr vm.globals, fnObj, fnVal):
     return valNil()
 
-  let fnVal = vm.globals[fnName]
   vm.push(fnVal)
   for arg in args:
     vm.push(arg)
