@@ -1,21 +1,22 @@
 import vm, compiler
 
-proc testVM() =
+proc testVMUpgrades() =
   var vm = initVM()
+
+  # Test 1: Functions, Recursion, and Local Scope
   let src = """
-  var sum = 0;
-  var i = 1;
-  while (i <= 10) {
-    sum = sum + i;
-    i = i + 1;
+  fn fib(n) {
+    if (n <= 1) {
+      return n;
+    }
+    return fib(n - 1) + fib(n - 2);
   }
-  print sum;
+  print fib(10);
   """
   let res = vm.interpret(src)
-  assert res == irOk, "VM execution failed!"
-  assert vm.globals["sum"].kind == vkNumber and vm.globals["sum"].numberVal == 55.0
+  assert res == irOk, "VM execution failed for recursive function!"
   assert vm.output == "55.0\n"
 
-  echo "VM tests passed successfully!"
+  echo "VM upgrade unit tests passed successfully!"
 
-testVM()
+testVMUpgrades()

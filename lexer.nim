@@ -17,7 +17,8 @@ type
     tkIdentifier, tkNumber, tkString,
 
     # Keywords
-    tkIf, tkElse, tkWhile, tkFn, tkReturn, tkVar, tkPrint, tkTrue, tkFalse, tkNil
+    tkIf, tkElse, tkWhile, tkFn, tkReturn, tkVar, tkPrint, tkTrue, tkFalse, tkNil,
+    tkAnd, tkOr
 
   Token* = object
     kind*: TokenType
@@ -101,6 +102,7 @@ proc checkKeyword(lexer: Lexer, start, length: int, rest: string, kind: TokenTyp
 proc identifierKind(lexer: Lexer): TokenType =
   let c = lexer.source[lexer.start]
   case c
+  of 'a': return lexer.checkKeyword(1, 2, "nd", tkAnd)
   of 'e': return lexer.checkKeyword(1, 3, "lse", tkElse)
   of 'f':
     if lexer.current - lexer.start > 1:
@@ -110,6 +112,7 @@ proc identifierKind(lexer: Lexer): TokenType =
       else: discard
   of 'i': return lexer.checkKeyword(1, 1, "f", tkIf)
   of 'n': return lexer.checkKeyword(1, 2, "il", tkNil)
+  of 'o': return lexer.checkKeyword(1, 1, "r", tkOr)
   of 'p': return lexer.checkKeyword(1, 4, "rint", tkPrint)
   of 'r': return lexer.checkKeyword(1, 5, "eturn", tkReturn)
   of 't': return lexer.checkKeyword(1, 3, "rue", tkTrue)

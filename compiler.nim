@@ -1,24 +1,139 @@
-## compiler.nim - Single-pass Pratt Parser & Bytecode Compiler for lightweight Nim engine
+## compiler.nim - 8-Byte NaN-Tagged Single-Pass Pratt Compiler & Local Resolver
 
 import lexer
 
+# --------------------------------------------------
+# 8-Byte NaN-Tagged Value Representation
+# --------------------------------------------------
+
 type
-  ValueKind* = enum
-    vkNil, vkBool, vkNumber, vkString
+  Value* = distinct uint64
 
-  Value* = object
-    case kind*: ValueKind
-    of vkNil: discard
-    of vkBool: boolVal*: bool
-    of vkNumber: numberVal*: float64
-    of vkString: strVal*: string
+const
+  QNAN: uint64     = 0x7ffc000000000000'u64
+  SIGN_BIT: uint64 = 0x8000000000000000'u64
 
+  TAG_NIL: uint64   = 1
+  TAG_FALSE: uint64 = 2
+  TAG_TRUE: uint64  = 3
+
+template valNil*(): Value = Value(QNAN or TAG_NIL)
+template valBool*(b: bool): Value = Value(QNAN or (if b: TAG_TRUE else: TAG_FALSE))
+template valNum*(num: float64): Value = cast[Value](num)
+template valObj*(p: pointer): Value = Value(SIGN_BIT or QNAN or (cast[uint64](p) and 0x0000FFFFFFFFFFFF'u64))
+
+template isNil*(v: Value): bool = uint64(v) == (QNAN or TAG_NIL)
+template isBool*(v: Value): bool = (uint64(v) and not 1'u64) == (QNAN or TAG_FALSE)
+template asBool*(v: Value): bool = uint64(v) == (QNAN or TAG_TRUE)
+
+template isNum*(v: Value): bool = (uint64(v) and QNAN) != QNAN
+template asNum*(v: Value): float64 = cast[float64](v)
+
+template isObj*(v: Value): bool = (uint64(v) and (SIGN_BIT or QNAN)) == (SIGN_BIT or QNAN)
+template asObj*(v: Value): pointer = cast[pointer](uint64(v) and 0x0000FFFFFFFFFFFF'u64)
+
+# --------------------------------------------------
+# Heap Objects (ObjString, ObjFunction, ObjNative, ObjUserData)
+# --------------------------------------------------
+
+type
+  ObjKind* = enum
+    objString,
+    objFunction,
+    objNative,
+    objUserData
+
+  ObjHeader* = object
+    kind*: ObjKind
+
+  ObjString* = object
+    header*: ObjHeader
+    strVal*: string
+    hash*: uint32
+
+  Chunk* = object
+    code*: seq[uint8]
+    constants*: seq[Value]
+    lines*: seq[int]
+
+  ObjFunction* = object
+    header*: ObjHeader
+    arity*: int
+    chunk*: Chunk
+    name*: string
+
+  VMForward* = ptr object # Abstract forward for NativeFn signature
+  NativeFn* = proc(vm: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.}
+
+  ObjNative* = object
+    header*: ObjHeader
+    name*: string
+    fn*: NativeFn
+
+  ObjUserData* = object
+    header*: ObjHeader
+    typeId*: int
+    finalizer*: proc(p: pointer) {.nimcall.}
+    data*: pointer
+
+proc isObjKind*(v: Value, kind: ObjKind): bool =
+  if not isObj(v): return false
+  let ptrHeader = cast[ptr ObjHeader](asObj(v))
+  if ptrHeader == nil: return false
+  return ptrHeader.kind == kind
+
+proc asObjString*(v: Value): ptr ObjString =
+  cast[ptr ObjString](asObj(v))
+
+proc asObjFunction*(v: Value): ptr ObjFunction =
+  cast[ptr ObjFunction](asObj(v))
+
+proc asObjNative*(v: Value): ptr ObjNative =
+  cast[ptr ObjNative](asObj(v))
+
+proc asObjUserData*(v: Value): ptr ObjUserData =
+  cast[ptr ObjUserData](asObj(v))
+
+proc `==`*(a, b: Value): bool =
+  uint64(a) == uint64(b)
+
+proc valuesEqual*(a, b: Value): bool =
+  if isNum(a) and isNum(b): return asNum(a) == asNum(b)
+  if isObjKind(a, objString) and isObjKind(b, objString):
+    if asObj(a) == asObj(b): return true
+    return asObjString(a).strVal == asObjString(b).strVal
+  return uint64(a) == uint64(b)
+
+proc `$`*(v: Value): string =
+  if isNil(v): return "nil"
+  if isBool(v): return $asBool(v)
+  if isNum(v): return $asNum(v)
+  if isObj(v):
+    let ptrHeader = cast[ptr ObjHeader](asObj(v))
+    if ptrHeader == nil: return "<null obj>"
+    case ptrHeader.kind
+    of objString: return asObjString(v).strVal
+    of objFunction:
+      let fn = asObjFunction(v)
+      if fn.name.len == 0: return "<script>"
+      else: return "<fn " & fn.name & ">"
+    of objNative: return "<native fn " & asObjNative(v).name & ">"
+    of objUserData: return "<userdata>"
+  return "<unknown>"
+
+# --------------------------------------------------
+# OpCodes
+# --------------------------------------------------
+
+type
   OpCode* = enum
     opConstant,
     opNil,
     opTrue,
     opFalse,
     opPop,
+    opGetLocal,
+    opSetLocal,
     opDefineGlobal,
     opGetGlobal,
     opSetGlobal,
@@ -35,13 +150,14 @@ type
     opJumpIfFalse,
     opJump,
     opLoop,
+    opCall,
     opReturn
 
-  Chunk* = object
-    code*: seq[uint8]
-    constants*: seq[Value]
-    lines*: seq[int]
+# --------------------------------------------------
+# Compiler & Pratt Parsing
+# --------------------------------------------------
 
+type
   Precedence* = enum
     precNone,
     precAssignment, # =
@@ -62,38 +178,54 @@ type
     infix*: ParseFn
     precedence*: Precedence
 
+  Local* = object
+    name*: Token
+    depth*: int
+
+  FunctionType* = enum
+    ftScript,
+    ftFunction
+
   Compiler* = object
+    enclosing*: ptr Compiler
+    function*: ptr ObjFunction
+    functionType*: FunctionType
     lexer*: Lexer
     current*: Token
     previous*: Token
-    chunk*: Chunk
+    locals*: array[256, Local]
+    localCount*: int
+    scopeDepth*: int
     hadError*: bool
     panicMode*: bool
 
-proc initCompiler*(source: string): Compiler =
-  result.lexer = initLexer(source)
-  result.chunk = Chunk(code: @[], constants: @[], lines: @[])
-  result.hadError = false
-  result.panicMode = false
+proc newObjFunction*(name: string = ""): ptr ObjFunction =
+  let fn = cast[ptr ObjFunction](alloc0(sizeof(ObjFunction)))
+  fn.header = ObjHeader(kind: objFunction)
+  fn.arity = 0
+  fn.name = name
+  fn.chunk = Chunk(code: @[], constants: @[], lines: @[])
+  return fn
 
-proc `$`*(v: Value): string =
-  case v.kind
-  of vkNil: "nil"
-  of vkBool: $v.boolVal
-  of vkNumber: $v.numberVal
-  of vkString: v.strVal
+proc newObjString*(s: string): ptr ObjString =
+  var hash = 2166136261'u32
+  for c in s:
+    hash = hash xor uint8(c)
+    hash = hash * 16777619'u32
 
-proc valuesEqual*(a, b: Value): bool =
-  if a.kind != b.kind: return false
-  case a.kind
-  of vkNil: return true
-  of vkBool: return a.boolVal == b.boolVal
-  of vkNumber: return a.numberVal == b.numberVal
-  of vkString: return a.strVal == b.strVal
+  let strObj = cast[ptr ObjString](alloc0(sizeof(ObjString)))
+  strObj.header = ObjHeader(kind: objString)
+  strObj.strVal = s
+  strObj.hash = hash
+  return strObj
+
+proc currentChunk*(compiler: var Compiler): ptr Chunk =
+  addr compiler.function.chunk
 
 proc emitByte*(compiler: var Compiler, byteVal: uint8) =
-  compiler.chunk.code.add(byteVal)
-  compiler.chunk.lines.add(compiler.previous.line)
+  let chunk = compiler.currentChunk()
+  chunk.code.add(byteVal)
+  chunk.lines.add(compiler.previous.line)
 
 proc emitOp*(compiler: var Compiler, op: OpCode) =
   compiler.emitByte(uint8(ord(op)))
@@ -110,32 +242,31 @@ proc emitJump*(compiler: var Compiler, op: OpCode): int =
   compiler.emitOp(op)
   compiler.emitByte(0xFF)
   compiler.emitByte(0xFF)
-  return compiler.chunk.code.len - 2
+  return compiler.currentChunk().code.len - 2
 
 proc patchJump*(compiler: var Compiler, offset: int) =
-  let jump = compiler.chunk.code.len - offset - 2
+  let jump = compiler.currentChunk().code.len - offset - 2
   if jump > 65535:
     compiler.hadError = true
-    # Error: Too much code to jump over.
     return
-  compiler.chunk.code[offset] = uint8((jump shr 8) and 0xFF)
-  compiler.chunk.code[offset + 1] = uint8(jump and 0xFF)
+  compiler.currentChunk().code[offset] = uint8((jump shr 8) and 0xFF)
+  compiler.currentChunk().code[offset + 1] = uint8(jump and 0xFF)
 
 proc emitLoop*(compiler: var Compiler, loopStart: int) =
   compiler.emitOp(opLoop)
-  let jump = compiler.chunk.code.len - loopStart + 2
+  let jump = compiler.currentChunk().code.len - loopStart + 2
   if jump > 65535:
     compiler.hadError = true
   compiler.emitByte(uint8((jump shr 8) and 0xFF))
   compiler.emitByte(uint8(jump and 0xFF))
 
 proc addConstant*(compiler: var Compiler, value: Value): uint16 =
-  # Search existing constants to save space
-  for i in 0 ..< compiler.chunk.constants.len:
-    if valuesEqual(compiler.chunk.constants[i], value):
+  let chunk = compiler.currentChunk()
+  for i in 0 ..< chunk.constants.len:
+    if valuesEqual(chunk.constants[i], value):
       return uint16(i)
-  compiler.chunk.constants.add(value)
-  let index = compiler.chunk.constants.len - 1
+  chunk.constants.add(value)
+  let index = chunk.constants.len - 1
   if index > 65535:
     compiler.hadError = true
     return 0
@@ -143,11 +274,28 @@ proc addConstant*(compiler: var Compiler, value: Value): uint16 =
 
 proc emitConstant*(compiler: var Compiler, value: Value) =
   let constant = compiler.addConstant(value)
-  if constant <= 255:
-    compiler.emitOpAndByte(opConstant, uint8(constant))
+  if constant > 255:
+    compiler.hadError = true
+    stderr.write("Too many constants in one chunk.\n")
+    return
+  compiler.emitOpAndByte(opConstant, uint8(constant))
+
+proc initCompiler*(compiler: var Compiler, source: string, fnType: FunctionType = ftScript, fnName: string = "", enclosing: ptr Compiler = nil) =
+  compiler.enclosing = enclosing
+  compiler.function = newObjFunction(fnName)
+  compiler.functionType = fnType
+  if enclosing != nil:
+    compiler.lexer = enclosing.lexer
   else:
-    # We could support opConstant16 if needed, for simplicity 256 constants per chunk/script
-    compiler.emitOpAndByte(opConstant, uint8(constant and 0xFF))
+    compiler.lexer = initLexer(source)
+  compiler.localCount = 0
+  compiler.scopeDepth = 0
+  compiler.hadError = false
+  compiler.panicMode = false
+
+  # Claim local slot 0 for VM internal call frame reserve
+  compiler.locals[0] = Local(name: Token(lexeme: ""), depth: 0)
+  inc compiler.localCount
 
 proc errorAt*(compiler: var Compiler, token: Token, message: string) =
   if compiler.panicMode: return
@@ -189,7 +337,7 @@ proc match*(compiler: var Compiler, kind: TokenType): bool =
   compiler.advance()
   return true
 
-# Forward declarations for Pratt parser
+# Forward declarations
 proc expression*(compiler: var Compiler)
 proc statement*(compiler: var Compiler)
 proc declaration*(compiler: var Compiler)
@@ -197,12 +345,11 @@ proc parsePrecedence*(compiler: var Compiler, precedence: Precedence)
 proc getRule*(kind: TokenType): ParseRule
 
 proc number*(compiler: var Compiler, canAssign: bool) =
-  let value = Value(kind: vkNumber, numberVal: compiler.previous.numberVal)
-  compiler.emitConstant(value)
+  compiler.emitConstant(valNum(compiler.previous.numberVal))
 
 proc stringExpr*(compiler: var Compiler, canAssign: bool) =
-  let value = Value(kind: vkString, strVal: compiler.previous.strVal)
-  compiler.emitConstant(value)
+  let strObj = newObjString(compiler.previous.strVal)
+  compiler.emitConstant(valObj(strObj))
 
 proc literal*(compiler: var Compiler, canAssign: bool) =
   case compiler.previous.kind
@@ -247,17 +394,66 @@ proc binary*(compiler: var Compiler, canAssign: bool) =
     compiler.emitOp(opNot)
   else: return
 
+proc argumentList*(compiler: var Compiler): uint8 =
+  var argCount: uint8 = 0
+  if not compiler.check(tkRParen):
+    while true:
+      compiler.expression()
+      if argCount == 255:
+        compiler.error("Cannot have more than 255 arguments.")
+      inc argCount
+      if not compiler.match(tkComma): break
+  compiler.consume(tkRParen, "Expect ')' after arguments.")
+  return argCount
+
+proc call*(compiler: var Compiler, canAssign: bool) =
+  let argCount = compiler.argumentList()
+  compiler.emitOpAndByte(opCall, argCount)
+
+proc andExpr*(compiler: var Compiler, canAssign: bool) =
+  let endJump = compiler.emitJump(opJumpIfFalse)
+  compiler.emitOp(opPop)
+  compiler.parsePrecedence(precAnd)
+  compiler.patchJump(endJump)
+
+proc orExpr*(compiler: var Compiler, canAssign: bool) =
+  let elseJump = compiler.emitJump(opJumpIfFalse)
+  let endJump = compiler.emitJump(opJump)
+  compiler.patchJump(elseJump)
+  compiler.emitOp(opPop)
+  compiler.parsePrecedence(precOr)
+  compiler.patchJump(endJump)
+
+proc resolveLocal*(compiler: var Compiler, name: Token): int =
+  for i in countdown(compiler.localCount - 1, 0):
+    let local = compiler.locals[i]
+    if local.name.lexeme == name.lexeme:
+      if local.depth == -1:
+        compiler.error("Cannot read local variable in its own initializer.")
+      return i
+  return -1
+
 proc identifierConstant*(compiler: var Compiler, name: Token): uint16 =
-  let value = Value(kind: vkString, strVal: name.lexeme)
-  return compiler.addConstant(value)
+  let strObj = newObjString(name.lexeme)
+  return compiler.addConstant(valObj(strObj))
 
 proc variable*(compiler: var Compiler, canAssign: bool) =
-  let arg = compiler.identifierConstant(compiler.previous)
+  var getOp, setOp: OpCode
+  var arg: int = compiler.resolveLocal(compiler.previous)
+
+  if arg != -1:
+    getOp = opGetLocal
+    setOp = opSetLocal
+  else:
+    arg = int(compiler.identifierConstant(compiler.previous))
+    getOp = opGetGlobal
+    setOp = opSetGlobal
+
   if canAssign and compiler.match(tkAssign):
     compiler.expression()
-    compiler.emitOpAndByte(opSetGlobal, uint8(arg and 0xFF))
+    compiler.emitOpAndByte(setOp, uint8(arg and 0xFF))
   else:
-    compiler.emitOpAndByte(opGetGlobal, uint8(arg and 0xFF))
+    compiler.emitOpAndByte(getOp, uint8(arg and 0xFF))
 
 proc parsePrecedence*(compiler: var Compiler, precedence: Precedence) =
   compiler.advance()
@@ -279,7 +475,7 @@ proc parsePrecedence*(compiler: var Compiler, precedence: Precedence) =
 
 proc getRule*(kind: TokenType): ParseRule =
   case kind
-  of tkLParen: ParseRule(prefix: grouping, infix: nil, precedence: precNone)
+  of tkLParen: ParseRule(prefix: grouping, infix: call, precedence: precCall)
   of tkMinus: ParseRule(prefix: unary, infix: binary, precedence: precTerm)
   of tkPlus: ParseRule(prefix: nil, infix: binary, precedence: precTerm)
   of tkSlash: ParseRule(prefix: nil, infix: binary, precedence: precFactor)
@@ -288,6 +484,8 @@ proc getRule*(kind: TokenType): ParseRule =
   of tkNotEq: ParseRule(prefix: nil, infix: binary, precedence: precEquality)
   of tkEq: ParseRule(prefix: nil, infix: binary, precedence: precEquality)
   of tkGt, tkGtEq, tkLt, tkLtEq: ParseRule(prefix: nil, infix: binary, precedence: precComparison)
+  of tkAnd: ParseRule(prefix: nil, infix: andExpr, precedence: precAnd)
+  of tkOr: ParseRule(prefix: nil, infix: orExpr, precedence: precOr)
   of tkIdentifier: ParseRule(prefix: variable, infix: nil, precedence: precNone)
   of tkString: ParseRule(prefix: stringExpr, infix: nil, precedence: precNone)
   of tkNumber: ParseRule(prefix: number, infix: nil, precedence: precNone)
@@ -296,6 +494,18 @@ proc getRule*(kind: TokenType): ParseRule =
 
 proc expression*(compiler: var Compiler) =
   compiler.parsePrecedence(precAssignment)
+
+proc blockStatement*(compiler: var Compiler) =
+  inc compiler.scopeDepth
+  while not compiler.check(tkRBrace) and not compiler.check(tkEof):
+    compiler.declaration()
+  compiler.consume(tkRBrace, "Expect '}' after block.")
+  dec compiler.scopeDepth
+
+  # Pop out of scope local variables
+  while compiler.localCount > 0 and compiler.locals[compiler.localCount - 1].depth > compiler.scopeDepth:
+    compiler.emitOp(opPop)
+    dec compiler.localCount
 
 proc printStatement*(compiler: var Compiler) =
   compiler.expression()
@@ -307,18 +517,13 @@ proc expressionStatement*(compiler: var Compiler) =
   compiler.consume(tkSemicolon, "Expect ';' after expression.")
   compiler.emitOp(opPop)
 
-proc blockStatement*(compiler: var Compiler) =
-  while not compiler.check(tkRBrace) and not compiler.check(tkEof):
-    compiler.declaration()
-  compiler.consume(tkRBrace, "Expect '}' after block.")
-
 proc ifStatement*(compiler: var Compiler) =
   compiler.consume(tkLParen, "Expect '(' after 'if'.")
   compiler.expression()
   compiler.consume(tkRParen, "Expect ')' after condition.")
 
   let thenJump = compiler.emitJump(opJumpIfFalse)
-  compiler.emitOp(opPop) # Pop condition on true path
+  compiler.emitOp(opPop)
 
   if compiler.match(tkLBrace):
     compiler.blockStatement()
@@ -327,7 +532,7 @@ proc ifStatement*(compiler: var Compiler) =
 
   let elseJump = compiler.emitJump(opJump)
   compiler.patchJump(thenJump)
-  compiler.emitOp(opPop) # Pop condition on false path
+  compiler.emitOp(opPop)
 
   if compiler.match(tkElse):
     if compiler.match(tkLBrace):
@@ -338,7 +543,7 @@ proc ifStatement*(compiler: var Compiler) =
   compiler.patchJump(elseJump)
 
 proc whileStatement*(compiler: var Compiler) =
-  let loopStart = compiler.chunk.code.len
+  let loopStart = compiler.currentChunk().code.len
   compiler.consume(tkLParen, "Expect '(' after 'while'.")
   compiler.expression()
   compiler.consume(tkRParen, "Expect ')' after condition.")
@@ -356,12 +561,16 @@ proc whileStatement*(compiler: var Compiler) =
   compiler.emitOp(opPop)
 
 proc returnStatement*(compiler: var Compiler) =
+  if compiler.functionType == ftScript:
+    compiler.error("Cannot return from top-level code.")
+
   if compiler.match(tkSemicolon):
     compiler.emitOp(opNil)
+    compiler.emitOp(opReturn)
   else:
     compiler.expression()
     compiler.consume(tkSemicolon, "Expect ';' after return value.")
-  compiler.emitOp(opReturn)
+    compiler.emitOp(opReturn)
 
 proc synchronize*(compiler: var Compiler) =
   compiler.panicMode = false
@@ -388,11 +597,41 @@ proc statement*(compiler: var Compiler) =
   else:
     compiler.expressionStatement()
 
+proc addLocal*(compiler: var Compiler, name: Token) =
+  if compiler.localCount == 256:
+    compiler.error("Too many local variables in function.")
+    return
+  var local = addr compiler.locals[compiler.localCount]
+  inc compiler.localCount
+  local.name = name
+  local.depth = -1 # Uninitialized state
+
+proc declareVariable*(compiler: var Compiler) =
+  if compiler.scopeDepth == 0: return
+  let name = compiler.previous
+  for i in countdown(compiler.localCount - 1, 0):
+    let local = compiler.locals[i]
+    if local.depth != -1 and local.depth < compiler.scopeDepth:
+      break
+    if local.name.lexeme == name.lexeme:
+      compiler.error("Already a variable with this name in this scope.")
+
+  compiler.addLocal(name)
+
 proc parseVariable*(compiler: var Compiler, errorMessage: string): uint16 =
   compiler.consume(tkIdentifier, errorMessage)
+  compiler.declareVariable()
+  if compiler.scopeDepth > 0: return 0
   return compiler.identifierConstant(compiler.previous)
 
+proc markInitialized*(compiler: var Compiler) =
+  if compiler.scopeDepth == 0: return
+  compiler.locals[compiler.localCount - 1].depth = compiler.scopeDepth
+
 proc defineVariable*(compiler: var Compiler, global: uint16) =
+  if compiler.scopeDepth > 0:
+    compiler.markInitialized()
+    return
   compiler.emitOpAndByte(opDefineGlobal, uint8(global and 0xFF))
 
 proc varDeclaration*(compiler: var Compiler) =
@@ -404,22 +643,65 @@ proc varDeclaration*(compiler: var Compiler) =
   compiler.consume(tkSemicolon, "Expect ';' after variable declaration.")
   compiler.defineVariable(global)
 
+proc functionDecl*(compiler: var Compiler) =
+  let global = compiler.parseVariable("Expect function name.")
+  compiler.markInitialized()
+
+  var fnCompiler: Compiler
+  initCompiler(fnCompiler, "", ftFunction, compiler.previous.lexeme, addr compiler)
+  fnCompiler.lexer = compiler.lexer
+  fnCompiler.current = compiler.current
+  fnCompiler.previous = compiler.previous
+  fnCompiler.scopeDepth = 1
+
+  fnCompiler.consume(tkLParen, "Expect '(' after function name.")
+  if not fnCompiler.check(tkRParen):
+    while true:
+      inc fnCompiler.function.arity
+      if fnCompiler.function.arity > 255:
+        fnCompiler.errorAtCurrent("Cannot have more than 255 parameters.")
+      let paramConstant = fnCompiler.parseVariable("Expect parameter name.")
+      fnCompiler.defineVariable(paramConstant)
+      if not fnCompiler.match(tkComma): break
+
+  fnCompiler.consume(tkRParen, "Expect ')' after parameters.")
+  fnCompiler.consume(tkLBrace, "Expect '{' before function body.")
+  fnCompiler.blockStatement()
+
+  fnCompiler.emitOp(opNil)
+  fnCompiler.emitOp(opReturn)
+
+  compiler.lexer = fnCompiler.lexer
+  compiler.current = fnCompiler.current
+  compiler.previous = fnCompiler.previous
+
+  let fnObj = fnCompiler.function
+  let constant = compiler.addConstant(valObj(fnObj))
+  compiler.emitOpAndByte(opConstant, uint8(constant and 0xFF))
+  compiler.defineVariable(global)
+
 proc declaration*(compiler: var Compiler) =
   if compiler.match(tkVar):
     compiler.varDeclaration()
+  elif compiler.match(tkFn):
+    compiler.functionDecl()
   else:
     compiler.statement()
 
   if compiler.panicMode:
     compiler.synchronize()
 
-proc compile*(source: string, chunk: var Chunk): bool =
-  var compiler = initCompiler(source)
+proc compile*(source: string): ptr ObjFunction =
+  var compiler: Compiler
+  initCompiler(compiler, source, ftScript, "")
   compiler.advance()
 
   while not compiler.match(tkEof):
     compiler.declaration()
 
+  compiler.emitOp(opNil)
   compiler.emitOp(opReturn)
-  chunk = compiler.chunk
-  return not compiler.hadError
+
+  if compiler.hadError:
+    return nil
+  return compiler.function

@@ -29,7 +29,7 @@ proc testLexer() =
   assert tokens[7].kind == tkIdentifier and tokens[7].lexeme == "x"
   assert tokens[8].kind == tkGtEq
   assert tokens[9].kind == tkNumber and tokens[9].numberVal == 10.0
-  assert tokens[10].kind == tkIdentifier and tokens[10].lexeme == "and"
+  assert tokens[10].kind == tkAnd and tokens[10].lexeme == "and"
   assert tokens[11].kind == tkTrue
   assert tokens[12].kind == tkRParen
   assert tokens[13].kind == tkLBrace
