@@ -165,6 +165,8 @@ proc callValue*(vm: var VM, callee: Value, argCount: int): bool =
       let nativeFn = asObjNative(callee)
       let argsPtr = cast[ptr UncheckedArray[Value]](addr vm.stack[vm.stackTop - argCount])
       let resVal = nativeFn.fn(addr vm, argCount, argsPtr)
+      if vm.stackTop == 0:
+        return false # Stack was reset due to runtime error
       vm.stackTop -= argCount + 1
       vm.push(resVal)
       return true

@@ -1,9 +1,10 @@
-## api.nim - Clean Host Interface & Automatic Nim Proc Auto-Binder
+## api.nim - Clean Host Interface, Macro Auto-Binder & Dynamic FFI
 
 import compiler, vm
 import std/macros
+import std/dynlib
 import std/[math, os, strutils]
-export compiler.Value, compiler.ObjKind, compiler.isNum, compiler.isBool, compiler.isObjKind, compiler.asNum, compiler.asBool, compiler.asObjString, compiler.valNil, compiler.valNum, compiler.valBool, compiler.valObj, vm.InterpretResult, vm.VM
+export compiler.Value, compiler.ObjKind, compiler.isNum, compiler.isBool, compiler.isObjKind, compiler.asNum, compiler.asBool, compiler.asObjString, compiler.asObjUserData, compiler.valNil, compiler.valNum, compiler.valBool, compiler.valObj, vm.InterpretResult, vm.VM
 
 proc runScript*(source: string): InterpretResult =
   var vm = initVM()
@@ -111,6 +112,59 @@ macro exposeProc*(vm: var VM, procSym: typed): untyped =
   procDef[0][0][2][6] = procBody
   result = procDef
 
+proc nativeFFILoad*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.} =
+  let vm = cast[ptr VM](vmPtr)
+  if argc < 1 or not isObjKind(args[0], objString):
+    return valNil()
+
+  let symName = asObjString(args[0]).strVal
+  let handle = loadLib()
+  if handle == nil:
+    vm[].runtimeError("Could not open executable handle for FFI symbol lookup.")
+    return valNil()
+
+  let symAddr = handle.symAddr(symName.cstring)
+  if symAddr == nil:
+    vm[].runtimeError("Could not resolve FFI symbol: " & symName)
+    return valNil()
+
+  let udata = cast[ptr ObjUserData](alloc0(sizeof(ObjUserData)))
+  udata.header = ObjHeader(kind: objUserData)
+  udata.data = symAddr
+  vm.objects.add(cast[pointer](udata))
+  return valObj(udata)
+
+proc nativeFFICall*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.} =
+  let vm = cast[ptr VM](vmPtr)
+  if argc < 1 or not isObjKind(args[0], objUserData):
+    return valNil()
+
+  let udata = asObjUserData(args[0])
+  let fnPtr = udata.data
+  if fnPtr == nil:
+    return valNil()
+
+  if argc == 1:
+    type Fn0 = proc(): float64 {.cdecl.}
+    let res = cast[Fn0](fnPtr)()
+    return valNum(res)
+  elif argc == 2:
+    if isNum(args[1]):
+      type Fn1F = proc(a: float64): float64 {.cdecl.}
+      let res = cast[Fn1F](fnPtr)(asNum(args[1]))
+      return valNum(res)
+    elif isObjKind(args[1], objString):
+      type Fn1S = proc(s: cstring): int32 {.cdecl.}
+      let res = cast[Fn1S](fnPtr)(cstring(asObjString(args[1]).strVal))
+      return valNum(float64(res))
+  elif argc == 3:
+    if isNum(args[1]) and isNum(args[2]):
+      type Fn2F = proc(a, b: float64): float64 {.cdecl.}
+      let res = cast[Fn2F](fnPtr)(asNum(args[1]), asNum(args[2]))
+      return valNum(res)
+
+  return valNil()
+
 proc env*(key: string): string = getEnv(key)
 
 proc loadStdlib*(vm: var VM) =
@@ -128,6 +182,10 @@ proc loadStdlib*(vm: var VM) =
   vm.exposeProc(strip)
   vm.exposeProc(toUpperAscii)
   vm.exposeProc(toLowerAscii)
+
+  # Dynamic Runtime FFI
+  vm.registerNative("ffiLoad", nativeFFILoad)
+  vm.registerNative("ffiCall", nativeFFICall)
 
 proc callFunction*(vm: var VM, fnName: string, args: openArray[Value]): Value =
   if not vm.globals.contains(fnName):

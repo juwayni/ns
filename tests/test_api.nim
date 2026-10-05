@@ -1,6 +1,9 @@
 import api, vm, compiler
 
-proc testHostAPIAutoBinder() =
+proc customFFIMath(a, b: float64): float64 {.exportc: "customFFIMath", dynlib, cdecl.} =
+  return a * 2.0 + b
+
+proc testHostAPIAutoBinderAndFFI() =
   var vm = initVM()
   vm.loadStdlib()
 
@@ -11,11 +14,23 @@ proc testHostAPIAutoBinder() =
   print sq;
   print up;
   """
-  let res = runScriptEx(src, vm)
-  assert res == irOk
+  let res1 = runScriptEx(src, vm)
+  assert res1 == irOk
   assert vm.output == "4.0\nHELLO SCRIPT\n"
 
-  # Test 2: Bidirectional callFunction from Nim host into script
+  # Test 2: Dynamic FFI symbol resolution from current executable address space
+  let ffiSrc = """
+  var sym = ffiLoad("customFFIMath");
+  var res = ffiCall(sym, 10.0, 5.0);
+  print res;
+  """
+  var vmFFI = initVM()
+  vmFFI.loadStdlib()
+  let res2 = runScriptEx(ffiSrc, vmFFI)
+  assert res2 == irOk
+  assert vmFFI.output == "25.0\n"
+
+  # Test 3: Bidirectional callFunction from Nim host into script
   let scriptFn = """
   fn multiply(x, y) {
     return x * y;
@@ -27,6 +42,7 @@ proc testHostAPIAutoBinder() =
   assert isNum(resultVal) and asNum(resultVal) == 42.0
 
   freeVM(vm)
-  echo "Host API Auto-Binder tests passed successfully!"
+  freeVM(vmFFI)
+  echo "Host API Auto-Binder & Dynamic FFI tests passed successfully!"
 
-testHostAPIAutoBinder()
+testHostAPIAutoBinderAndFFI()
