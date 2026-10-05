@@ -1,20 +1,19 @@
 import api, vm, compiler
 
-proc testHostAPI() =
+proc testHostAPIAutoBinder() =
   var vm = initVM()
-  vm.registerMathModule()
+  vm.loadStdlib()
 
-  # Test 1: Calling Nim Native Math Bridge from script
+  # Test 1: Auto-bound Math, OS, and StrUtils procs called directly from script
   let src = """
-  var s = sin(0.0);
   var sq = sqrt(16.0);
-  var a = abs(-42.5);
+  var up = toUpperAscii("hello script");
   print sq;
-  print a;
+  print up;
   """
   let res = runScriptEx(src, vm)
   assert res == irOk
-  assert vm.output == "4.0\n42.5\n"
+  assert vm.output == "4.0\nHELLO SCRIPT\n"
 
   # Test 2: Bidirectional callFunction from Nim host into script
   let scriptFn = """
@@ -27,6 +26,7 @@ proc testHostAPI() =
   let resultVal = vm.callFunction("multiply", [valNum(6.0), valNum(7.0)])
   assert isNum(resultVal) and asNum(resultVal) == 42.0
 
-  echo "Host API and Native Nim Bridge tests passed successfully!"
+  freeVM(vm)
+  echo "Host API Auto-Binder tests passed successfully!"
 
-testHostAPI()
+testHostAPIAutoBinder()

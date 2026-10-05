@@ -65,7 +65,7 @@ proc testEndToEnd() =
 
   # Test 5: Native Nim Stdlib Bridge
   var vm5 = initVM()
-  vm5.registerMathModule()
+  vm5.loadStdlib()
   let script5 = """
   var sq = sqrt(144.0);
   print sq;
