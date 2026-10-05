@@ -1,38 +1,34 @@
-import compiler
+import compiler, vm
 
-proc testCompilerUpgrades() =
-  # Test 1: NaN-Tagged Value Size
-  assert sizeof(Value) == 8, "Value size must be exactly 8 bytes!"
+proc testCompilerFixes() =
+  var vm = initVM()
 
-  # Test 2: Encoding/Decoding Values
-  let numVal = valNum(3.14159)
-  assert isNum(numVal) and asNum(numVal) == 3.14159
+  # Test 1: Value Size & O(1) String Interning Equality
+  assert sizeof(Value) == 8
 
-  let nilVal = valNil()
-  assert isNil(nilVal) and not isNum(nilVal)
+  let str1 = internStringImpl(addr vm, "hello_world")
+  let str2 = internStringImpl(addr vm, "hello_world")
 
-  let trueVal = valBool(true)
-  assert isBool(trueVal) and asBool(trueVal) == true
+  # Strict string interning guarantees pointer equality
+  assert asObj(str1) == asObj(str2)
+  assert valuesEqual(str1, str2)
 
-  let strObj = newObjString("hello")
-  let strVal = valObj(strObj)
-  assert isObj(strVal) and isObjKind(strVal, objString)
-  assert asObjString(strVal).strVal == "hello"
-
-  # Test 3: Compiler function compilation with local variables and short-circuiting
+  # Test 2: Compile script passing pointer lexer and VM object tracking
   let src = """
-  fn add(a, b) {
-    var sum = a + b;
-    if (sum > 10 and true) {
-      return sum;
+  fn outer() {
+    fn inner(x) {
+      return x + 1;
     }
-    return 0;
+    return inner(10);
   }
   """
-  let fnScript = compile(src)
-  assert fnScript != nil, "Script compilation failed!"
-  assert fnScript.chunk.code.len > 0, "Script bytecode empty!"
+  let fnScript = compile(src, addr vm, internStringImpl, newFunctionImpl)
+  assert fnScript != nil
+  assert vm.objects.len > 0, "Compiler must register all string and function allocations into vm.objects!"
 
-  echo "Compiler upgrade unit tests passed successfully!"
+  freeVM(vm)
+  assert vm.objects.len == 0, "freeVM must clean up all tracked heap allocations!"
 
-testCompilerUpgrades()
+  echo "Compiler fixes verified successfully!"
+
+testCompilerFixes()

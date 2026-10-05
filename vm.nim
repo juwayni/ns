@@ -26,7 +26,7 @@ type
     stackTop*: int
     globals*: Table[string, Value]
     strings*: Table[string, ptr ObjString] # Interned string table
-    objects*: seq[pointer] # Allocated heap objects tracking
+    objects*: seq[pointer] # Tracked heap objects pool for zero-leak GC deallocation
     output*: string
 
 proc initVM*(): VM =
@@ -80,13 +80,26 @@ proc isTruthy*(value: Value): bool =
   if isObjKind(value, objString): return asObjString(value).strVal.len > 0
   return true
 
-proc internString*(vm: var VM, str: string): ptr ObjString =
+proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimcall.} =
+  let vm = cast[ptr VM](vmPtr)
+  let fn = cast[ptr ObjFunction](alloc0(sizeof(ObjFunction)))
+  fn.header = ObjHeader(kind: objFunction)
+  fn.arity = 0
+  fn.name = name
+  fn.chunk = Chunk(code: @[], constants: @[], lines: @[])
+  vm.objects.add(cast[pointer](fn))
+  return fn
+
+proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
+  let vm = cast[ptr VM](vmPtr)
   if vm.strings.contains(str):
-    return vm.strings[str]
-  let obj = newObjString(str)
+    return valObj(vm.strings[str])
+  let obj = cast[ptr ObjString](alloc0(sizeof(ObjString)))
+  obj.header = ObjHeader(kind: objString)
+  obj.strVal = str
   vm.strings[str] = obj
   vm.objects.add(cast[pointer](obj))
-  return obj
+  return valObj(obj)
 
 proc registerNative*(vm: var VM, name: string, nativeProc: NativeFn) =
   let nativeObj = cast[ptr ObjNative](alloc0(sizeof(ObjNative)))
@@ -94,8 +107,8 @@ proc registerNative*(vm: var VM, name: string, nativeProc: NativeFn) =
   nativeObj.name = name
   nativeObj.fn = nativeProc
   vm.objects.add(cast[pointer](nativeObj))
-  let internedName = vm.internString(name)
-  vm.globals[internedName.strVal] = valObj(nativeObj)
+  let internedVal = internStringImpl(addr vm, name)
+  vm.globals[asObjString(internedVal).strVal] = valObj(nativeObj)
 
 proc freeVM*(vm: var VM) =
   for objPtr in vm.objects:
@@ -259,8 +272,8 @@ proc run*(vm: var VM): InterpretResult =
         vm.push(valNum(asNum(a) + asNum(b)))
       elif isObjKind(a, objString) and isObjKind(b, objString):
         let concatStr = asObjString(a).strVal & asObjString(b).strVal
-        let strObj = vm.internString(concatStr)
-        vm.push(valObj(strObj))
+        let strVal = internStringImpl(addr vm, concatStr)
+        vm.push(strVal)
       else:
         vm.runtimeError("Operands must be numbers or strings.")
         return irRuntimeError
@@ -341,7 +354,7 @@ proc run*(vm: var VM): InterpretResult =
       frame = addr vm.frames[vm.frameCount - 1]
 
 proc interpret*(vm: var VM, source: string): InterpretResult =
-  let scriptFn = compile(source)
+  let scriptFn = compile(source, addr vm, internStringImpl, newFunctionImpl)
   if scriptFn == nil:
     return irCompileError
 

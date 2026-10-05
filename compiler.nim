@@ -62,7 +62,6 @@ type
     chunk*: Chunk
     name*: string
 
-  VMForward* = ptr object # Abstract forward for NativeFn signature
   NativeFn* = proc(vm: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.}
 
   ObjNative* = object
@@ -100,8 +99,8 @@ proc `==`*(a, b: Value): bool =
 proc valuesEqual*(a, b: Value): bool =
   if isNum(a) and isNum(b): return asNum(a) == asNum(b)
   if isObjKind(a, objString) and isObjKind(b, objString):
-    if asObj(a) == asObj(b): return true
-    return asObjString(a).strVal == asObjString(b).strVal
+    # O(1) Pointer Equality thanks to 100% strict String Interning!
+    return asObj(a) == asObj(b)
   return uint64(a) == uint64(b)
 
 proc `$`*(v: Value): string =
@@ -190,7 +189,10 @@ type
     enclosing*: ptr Compiler
     function*: ptr ObjFunction
     functionType*: FunctionType
-    lexer*: Lexer
+    lexer*: ptr Lexer # Shared pointer across nested function compilers
+    vm*: pointer     # Pointer to VM for GC tracking & String Interning
+    internStringProc*: proc(vm: pointer, s: string): Value {.nimcall.}
+    newFunctionProc*: proc(vm: pointer, name: string): ptr ObjFunction {.nimcall.}
     current*: Token
     previous*: Token
     locals*: array[256, Local]
@@ -198,26 +200,6 @@ type
     scopeDepth*: int
     hadError*: bool
     panicMode*: bool
-
-proc newObjFunction*(name: string = ""): ptr ObjFunction =
-  let fn = cast[ptr ObjFunction](alloc0(sizeof(ObjFunction)))
-  fn.header = ObjHeader(kind: objFunction)
-  fn.arity = 0
-  fn.name = name
-  fn.chunk = Chunk(code: @[], constants: @[], lines: @[])
-  return fn
-
-proc newObjString*(s: string): ptr ObjString =
-  var hash = 2166136261'u32
-  for c in s:
-    hash = hash xor uint8(c)
-    hash = hash * 16777619'u32
-
-  let strObj = cast[ptr ObjString](alloc0(sizeof(ObjString)))
-  strObj.header = ObjHeader(kind: objString)
-  strObj.strVal = s
-  strObj.hash = hash
-  return strObj
 
 proc currentChunk*(compiler: var Compiler): ptr Chunk =
   addr compiler.function.chunk
@@ -280,14 +262,21 @@ proc emitConstant*(compiler: var Compiler, value: Value) =
     return
   compiler.emitOpAndByte(opConstant, uint8(constant))
 
-proc initCompiler*(compiler: var Compiler, source: string, fnType: FunctionType = ftScript, fnName: string = "", enclosing: ptr Compiler = nil) =
+proc initCompiler*(compiler: var Compiler,
+                 lexerPtr: ptr Lexer,
+                 vmPtr: pointer,
+                 internStringProc: proc(vm: pointer, s: string): Value {.nimcall.},
+                 newFunctionProc: proc(vm: pointer, name: string): ptr ObjFunction {.nimcall.},
+                 fnType: FunctionType = ftScript,
+                 fnName: string = "",
+                 enclosing: ptr Compiler = nil) =
   compiler.enclosing = enclosing
-  compiler.function = newObjFunction(fnName)
+  compiler.lexer = lexerPtr
+  compiler.vm = vmPtr
+  compiler.internStringProc = internStringProc
+  compiler.newFunctionProc = newFunctionProc
+  compiler.function = newFunctionProc(vmPtr, fnName)
   compiler.functionType = fnType
-  if enclosing != nil:
-    compiler.lexer = enclosing.lexer
-  else:
-    compiler.lexer = initLexer(source)
   compiler.localCount = 0
   compiler.scopeDepth = 0
   compiler.hadError = false
@@ -319,7 +308,7 @@ proc errorAtCurrent*(compiler: var Compiler, message: string) =
 proc advance*(compiler: var Compiler) =
   compiler.previous = compiler.current
   while true:
-    compiler.current = compiler.lexer.nextToken()
+    compiler.current = compiler.lexer[].nextToken()
     if compiler.current.kind != tkError: break
     compiler.errorAtCurrent(compiler.current.errorMsg)
 
@@ -348,8 +337,9 @@ proc number*(compiler: var Compiler, canAssign: bool) =
   compiler.emitConstant(valNum(compiler.previous.numberVal))
 
 proc stringExpr*(compiler: var Compiler, canAssign: bool) =
-  let strObj = newObjString(compiler.previous.strVal)
-  compiler.emitConstant(valObj(strObj))
+  # Strict String Interning via VM GC pool!
+  let strVal = compiler.internStringProc(compiler.vm, compiler.previous.strVal)
+  compiler.emitConstant(strVal)
 
 proc literal*(compiler: var Compiler, canAssign: bool) =
   case compiler.previous.kind
@@ -434,8 +424,8 @@ proc resolveLocal*(compiler: var Compiler, name: Token): int =
   return -1
 
 proc identifierConstant*(compiler: var Compiler, name: Token): uint16 =
-  let strObj = newObjString(name.lexeme)
-  return compiler.addConstant(valObj(strObj))
+  let strVal = compiler.internStringProc(compiler.vm, name.lexeme)
+  return compiler.addConstant(strVal)
 
 proc variable*(compiler: var Compiler, canAssign: bool) =
   var getOp, setOp: OpCode
@@ -648,8 +638,7 @@ proc functionDecl*(compiler: var Compiler) =
   compiler.markInitialized()
 
   var fnCompiler: Compiler
-  initCompiler(fnCompiler, "", ftFunction, compiler.previous.lexeme, addr compiler)
-  fnCompiler.lexer = compiler.lexer
+  initCompiler(fnCompiler, compiler.lexer, compiler.vm, compiler.internStringProc, compiler.newFunctionProc, ftFunction, compiler.previous.lexeme, addr compiler)
   fnCompiler.current = compiler.current
   fnCompiler.previous = compiler.previous
   fnCompiler.scopeDepth = 1
@@ -671,7 +660,6 @@ proc functionDecl*(compiler: var Compiler) =
   fnCompiler.emitOp(opNil)
   fnCompiler.emitOp(opReturn)
 
-  compiler.lexer = fnCompiler.lexer
   compiler.current = fnCompiler.current
   compiler.previous = fnCompiler.previous
 
@@ -691,9 +679,13 @@ proc declaration*(compiler: var Compiler) =
   if compiler.panicMode:
     compiler.synchronize()
 
-proc compile*(source: string): ptr ObjFunction =
+proc compile*(source: string,
+              vmPtr: pointer,
+              internStringProc: proc(vm: pointer, s: string): Value {.nimcall.},
+              newFunctionProc: proc(vm: pointer, name: string): ptr ObjFunction {.nimcall.}): ptr ObjFunction =
+  var lexer = initLexer(source)
   var compiler: Compiler
-  initCompiler(compiler, source, ftScript, "")
+  initCompiler(compiler, addr lexer, vmPtr, internStringProc, newFunctionProc, ftScript, "")
   compiler.advance()
 
   while not compiler.match(tkEof):
