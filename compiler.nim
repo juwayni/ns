@@ -1,4 +1,4 @@
-## compiler.nim - 8-Byte NaN-Tagged Single-Pass Pratt Compiler & Local Resolver
+## compiler.nim - Single-Allocation ObjString, Lexical Closures & Pratt Parser
 
 import lexer
 
@@ -33,13 +33,15 @@ template isObj*(v: Value): bool = (uint64(v) and (SIGN_BIT or QNAN)) == (SIGN_BI
 template asObj*(v: Value): pointer = cast[pointer](uint64(v) and 0x0000FFFFFFFFFFFF'u64)
 
 # --------------------------------------------------
-# Heap Objects (ObjString, ObjFunction, ObjNative, ObjUserData)
+# Flexible-Array Single-Allocation Heap Objects
 # --------------------------------------------------
 
 type
   ObjKind* = enum
     objString,
     objFunction,
+    objClosure,
+    objUpvalue,
     objNative,
     objUserData
 
@@ -48,10 +50,12 @@ type
     isMarked*: bool
     next*: pointer # Linked list for GC sweep
 
+  # Flexible array single allocation: sizeof(ObjHeader) + 4 + 4 + N + 1
   ObjString* = object
     header*: ObjHeader
-    strVal*: string
     hash*: uint32
+    length*: int
+    chars*: UncheckedArray[char]
 
   Chunk* = object
     code*: seq[uint8]
@@ -61,8 +65,21 @@ type
   ObjFunction* = object
     header*: ObjHeader
     arity*: int
+    upvalueCount*: int
     chunk*: Chunk
     name*: string
+
+  ObjUpvalue* = object
+    header*: ObjHeader
+    location*: ptr Value
+    closed*: Value
+    next*: ptr ObjUpvalue
+
+  ObjClosure* = object
+    header*: ObjHeader
+    function*: ptr ObjFunction
+    upvalues*: ptr UncheckedArray[ptr ObjUpvalue]
+    upvalueCount*: int
 
   NativeFn* = proc(vm: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.}
 
@@ -89,11 +106,22 @@ proc asObjString*(v: Value): ptr ObjString =
 proc asObjFunction*(v: Value): ptr ObjFunction =
   cast[ptr ObjFunction](asObj(v))
 
+proc asObjClosure*(v: Value): ptr ObjClosure =
+  cast[ptr ObjClosure](asObj(v))
+
+proc asObjUpvalue*(v: Value): ptr ObjUpvalue =
+  cast[ptr ObjUpvalue](asObj(v))
+
 proc asObjNative*(v: Value): ptr ObjNative =
   cast[ptr ObjNative](asObj(v))
 
 proc asObjUserData*(v: Value): ptr ObjUserData =
   cast[ptr ObjUserData](asObj(v))
+
+proc getString*(strObj: ptr ObjString): string =
+  if strObj == nil or strObj.length == 0: return ""
+  result = newString(strObj.length)
+  copyMem(addr result[0], addr strObj.chars[0], strObj.length)
 
 proc `==`*(a, b: Value): bool =
   uint64(a) == uint64(b)
@@ -101,7 +129,6 @@ proc `==`*(a, b: Value): bool =
 proc valuesEqual*(a, b: Value): bool =
   if isNum(a) and isNum(b): return asNum(a) == asNum(b)
   if isObjKind(a, objString) and isObjKind(b, objString):
-    # O(1) Pointer Equality thanks to 100% strict String Interning!
     return asObj(a) == asObj(b)
   return uint64(a) == uint64(b)
 
@@ -113,11 +140,16 @@ proc `$`*(v: Value): string =
     let ptrHeader = cast[ptr ObjHeader](asObj(v))
     if ptrHeader == nil: return "<null obj>"
     case ptrHeader.kind
-    of objString: return asObjString(v).strVal
+    of objString: return getString(asObjString(v))
     of objFunction:
       let fn = asObjFunction(v)
       if fn.name.len == 0: return "<script>"
       else: return "<fn " & fn.name & ">"
+    of objClosure:
+      let fn = asObjClosure(v).function
+      if fn.name.len == 0: return "<script>"
+      else: return "<fn " & fn.name & ">"
+    of objUpvalue: return "<upvalue>"
     of objNative: return "<native fn " & asObjNative(v).name & ">"
     of objUserData: return "<userdata>"
   return "<unknown>"
@@ -143,9 +175,11 @@ type
     opSetLocal1,
     opSetLocal2,
     opSetLocal3,
-    opDefineGlobal,
     opGetGlobal,
+    opDefineGlobal,
     opSetGlobal,
+    opGetUpvalue,
+    opSetUpvalue,
     opEqual,
     opGreater,
     opLess,
@@ -160,6 +194,8 @@ type
     opJump,
     opLoop,
     opCall,
+    opClosure,
+    opCloseUpvalue,
     opReturn
 
 # --------------------------------------------------
@@ -190,6 +226,11 @@ type
   Local* = object
     name*: Token
     depth*: int
+    isCaptured*: bool
+
+  CompilerUpvalue* = object
+    index*: uint8
+    isLocal*: bool
 
   FunctionType* = enum
     ftScript,
@@ -199,14 +240,15 @@ type
     enclosing*: ptr Compiler
     function*: ptr ObjFunction
     functionType*: FunctionType
-    lexer*: ptr Lexer # Shared pointer across nested function compilers
-    vm*: pointer     # Pointer to VM for GC tracking & String Interning
+    lexer*: ptr Lexer
+    vm*: pointer
     internStringProc*: proc(vm: pointer, s: string): Value {.nimcall.}
     newFunctionProc*: proc(vm: pointer, name: string): ptr ObjFunction {.nimcall.}
     current*: Token
     previous*: Token
     locals*: array[256, Local]
     localCount*: int
+    upvalues*: array[256, CompilerUpvalue]
     scopeDepth*: int
     hadError*: bool
     panicMode*: bool
@@ -292,8 +334,8 @@ proc initCompiler*(compiler: var Compiler,
   compiler.hadError = false
   compiler.panicMode = false
 
-  # Claim local slot 0 for VM internal call frame reserve
-  compiler.locals[0] = Local(name: Token(lexeme: ""), depth: 0)
+  # Reserve local slot 0
+  compiler.locals[0] = Local(name: Token(lexeme: ""), depth: 0, isCaptured: false)
   inc compiler.localCount
 
 proc errorAt*(compiler: var Compiler, token: Token, message: string) =
@@ -347,7 +389,6 @@ proc number*(compiler: var Compiler, canAssign: bool) =
   compiler.emitConstant(valNum(compiler.previous.numberVal))
 
 proc stringExpr*(compiler: var Compiler, canAssign: bool) =
-  # Strict String Interning via VM GC pool!
   let strVal = compiler.internStringProc(compiler.vm, compiler.previous.strVal)
   compiler.emitConstant(strVal)
 
@@ -433,6 +474,36 @@ proc resolveLocal*(compiler: var Compiler, name: Token): int =
       return i
   return -1
 
+proc addUpvalue*(compiler: var Compiler, index: uint8, isLocal: bool): int =
+  let count = compiler.function.upvalueCount
+  for i in 0 ..< count:
+    let upvalue = compiler.upvalues[i]
+    if upvalue.index == index and upvalue.isLocal == isLocal:
+      return i
+
+  if count == 256:
+    compiler.error("Too many closure variables in function.")
+    return 0
+
+  compiler.upvalues[count].isLocal = isLocal
+  compiler.upvalues[count].index = index
+  inc compiler.function.upvalueCount
+  return count
+
+proc resolveUpvalue*(compiler: var Compiler, name: Token): int =
+  if compiler.enclosing == nil: return -1
+
+  let local = resolveLocal(compiler.enclosing[], name)
+  if local != -1:
+    compiler.enclosing.locals[local].isCaptured = true
+    return addUpvalue(compiler, uint8(local), true)
+
+  let upvalue = resolveUpvalue(compiler.enclosing[], name)
+  if upvalue != -1:
+    return addUpvalue(compiler, uint8(upvalue), false)
+
+  return -1
+
 proc identifierConstant*(compiler: var Compiler, name: Token): uint16 =
   let strVal = compiler.internStringProc(compiler.vm, name.lexeme)
   return compiler.addConstant(strVal)
@@ -445,9 +516,14 @@ proc variable*(compiler: var Compiler, canAssign: bool) =
     getOp = opGetLocal
     setOp = opSetLocal
   else:
-    arg = int(compiler.identifierConstant(compiler.previous))
-    getOp = opGetGlobal
-    setOp = opSetGlobal
+    arg = compiler.resolveUpvalue(compiler.previous)
+    if arg != -1:
+      getOp = opGetUpvalue
+      setOp = opSetUpvalue
+    else:
+      arg = int(compiler.identifierConstant(compiler.previous))
+      getOp = opGetGlobal
+      setOp = opSetGlobal
 
   if canAssign and compiler.match(tkAssign):
     compiler.expression()
@@ -510,9 +586,11 @@ proc blockStatement*(compiler: var Compiler) =
   compiler.consume(tkRBrace, "Expect '}' after block.")
   dec compiler.scopeDepth
 
-  # Pop out of scope local variables
   while compiler.localCount > 0 and compiler.locals[compiler.localCount - 1].depth > compiler.scopeDepth:
-    compiler.emitOp(opPop)
+    if compiler.locals[compiler.localCount - 1].isCaptured:
+      compiler.emitOp(opCloseUpvalue)
+    else:
+      compiler.emitOp(opPop)
     dec compiler.localCount
 
 proc printStatement*(compiler: var Compiler) =
@@ -612,7 +690,8 @@ proc addLocal*(compiler: var Compiler, name: Token) =
   var local = addr compiler.locals[compiler.localCount]
   inc compiler.localCount
   local.name = name
-  local.depth = -1 # Uninitialized state
+  local.depth = -1
+  local.isCaptured = false
 
 proc declareVariable*(compiler: var Compiler) =
   if compiler.scopeDepth == 0: return
@@ -683,7 +762,12 @@ proc functionDecl*(compiler: var Compiler) =
 
   let fnObj = fnCompiler.function
   let constant = compiler.addConstant(valObj(fnObj))
-  compiler.emitOpAndByte(opConstant, uint8(constant and 0xFF))
+  compiler.emitOpAndByte(opClosure, uint8(constant and 0xFF))
+
+  for i in 0 ..< fnObj.upvalueCount:
+    compiler.emitByte(if fnCompiler.upvalues[i].isLocal: 1'u8 else: 0'u8)
+    compiler.emitByte(fnCompiler.upvalues[i].index)
+
   compiler.defineVariable(global)
 
 proc declaration*(compiler: var Compiler) =

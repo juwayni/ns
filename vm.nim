@@ -1,4 +1,4 @@
-## vm.nim - High-Performance CallFrame, FlatTable & Mark-Sweep VM
+## vm.nim - High-Performance CallFrame, FlatTable, Lexical Closures & Mark-Sweep VM
 
 import compiler
 
@@ -13,7 +13,7 @@ type
     irRuntimeError
 
   CallFrame* = object
-    fn*: ptr ObjFunction
+    closure*: ptr ObjClosure
     ip*: int
     slots*: int # Offset into vm.stack for local variables of this frame
 
@@ -34,6 +34,7 @@ type
     globals*: FlatTable
     strings*: FlatTable
     objects*: pointer # Head pointer for linked list of heap objects
+    openUpvalues*: ptr ObjUpvalue
     grayStack*: seq[pointer]
     bytesAllocated*: int
     nextGC*: int
@@ -46,9 +47,11 @@ proc initVM*(): VM =
   result.globals = FlatTable()
   result.strings = FlatTable()
   result.objects = nil
+  result.openUpvalues = nil
   result.grayStack = @[]
   result.bytesAllocated = 0
   result.nextGC = 1024 * 1024
+  result.isCompiling = false
   result.output = ""
 
 proc resetStack*(vm: var VM) =
@@ -59,7 +62,7 @@ proc runtimeError*(vm: var VM, message: string) =
   stderr.write("Runtime Error: " & message & "\n")
   for i in countdown(vm.frameCount - 1, 0):
     let frame = addr vm.frames[i]
-    let fn = frame.fn
+    let fn = frame.closure.function
     let line = if frame.ip - 1 < fn.chunk.lines.len and frame.ip - 1 >= 0: fn.chunk.lines[frame.ip - 1] else: 0
     stderr.write("[line " & $line & "] in ")
     if fn.name.len == 0:
@@ -91,22 +94,28 @@ proc isTruthy*(value: Value): bool =
   if isNil(value): return false
   if isBool(value): return asBool(value)
   if isNum(value): return asNum(value) != 0.0
-  if isObjKind(value, objString): return asObjString(value).strVal.len > 0
+  if isObjKind(value, objString): return asObjString(value).length > 0
   return true
 
 # FlatTable Operations
+proc isSlotEmpty(entry: ptr Entry): bool =
+  return entry.key == nil and (uint64(entry.val) == 0 or isNil(entry.val))
+
 proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr ObjString): ptr Entry =
   var index = int(key.hash) and capacityMask
   var tombstone: ptr Entry = nil
   for _ in 0 .. capacityMask:
     let entry = addr entries[index]
     if entry.key == nil:
-      if isNil(entry.val):
+      if isSlotEmpty(entry):
         return if tombstone != nil: tombstone else: entry
       else:
         if tombstone == nil: tombstone = entry
-    elif entry.key == key or (entry.key.hash == key.hash and entry.key.strVal == key.strVal):
+    elif entry.key == key:
       return entry
+    elif entry.key.hash == key.hash and entry.key.length == key.length:
+      if key.length == 0 or equalMem(addr entry.key.chars[0], addr key.chars[0], key.length):
+        return entry
     index = (index + 1) and capacityMask
   return if tombstone != nil: tombstone else: addr entries[0]
 
@@ -161,10 +170,17 @@ proc blackenObject*(vm: var VM, objPtr: pointer) =
   let header = cast[ptr ObjHeader](objPtr)
   case header.kind
   of objString, objNative, objUserData: discard
+  of objUpvalue:
+    vm.markValue(cast[ptr ObjUpvalue](objPtr).closed)
   of objFunction:
     let fn = cast[ptr ObjFunction](objPtr)
     for constVal in fn.chunk.constants:
       vm.markValue(constVal)
+  of objClosure:
+    let closure = cast[ptr ObjClosure](objPtr)
+    vm.markObject(cast[pointer](closure.function))
+    for i in 0 ..< closure.upvalueCount:
+      vm.markObject(cast[pointer](closure.upvalues[i]))
 
 proc collectGarbage*(vm: var VM) =
   # Mark Roots
@@ -172,7 +188,12 @@ proc collectGarbage*(vm: var VM) =
     vm.markValue(vm.stack[i])
 
   for i in 0 ..< vm.frameCount:
-    vm.markObject(cast[pointer](vm.frames[i].fn))
+    vm.markObject(cast[pointer](vm.frames[i].closure))
+
+  var upvalue = vm.openUpvalues
+  while upvalue != nil:
+    vm.markObject(cast[pointer](upvalue))
+    upvalue = upvalue.next
 
   if vm.globals.entries != nil:
     for i in 0 .. vm.globals.capacityMask:
@@ -192,7 +213,8 @@ proc collectGarbage*(vm: var VM) =
       let entry = addr vm.strings.entries[i]
       if entry.key != nil and not entry.key.header.isMarked:
         entry.key = nil
-        entry.val = valBool(true) # Tombstone marker to preserve probe chain
+        entry.val = valBool(true) # Tombstone
+        dec vm.strings.count
 
   # Sweep Objects Linked List
   var previous: pointer = nil
@@ -202,7 +224,7 @@ proc collectGarbage*(vm: var VM) =
     let header = cast[ptr ObjHeader](current)
     let nextObj = header.next
     if header.isMarked:
-      header.isMarked = false # Reset mark for next GC
+      header.isMarked = false
       previous = current
       current = nextObj
     else:
@@ -215,9 +237,7 @@ proc collectGarbage*(vm: var VM) =
       current = nextObj
       case header.kind
       of objString:
-        let sObj = cast[ptr ObjString](unreached)
-        sObj.strVal = ""
-        dealloc(sObj)
+        dealloc(unreached)
       of objFunction:
         let fObj = cast[ptr ObjFunction](unreached)
         fObj.name = ""
@@ -225,6 +245,12 @@ proc collectGarbage*(vm: var VM) =
         fObj.chunk.constants = @[]
         fObj.chunk.lines = @[]
         dealloc(fObj)
+      of objClosure:
+        let cObj = cast[ptr ObjClosure](unreached)
+        if cObj.upvalues != nil: dealloc(cObj.upvalues)
+        dealloc(cObj)
+      of objUpvalue:
+        dealloc(unreached)
       of objNative:
         let nObj = cast[ptr ObjNative](unreached)
         nObj.name = ""
@@ -242,18 +268,64 @@ proc trackObject*(vm: var VM, objPtr: pointer) =
   header.next = vm.objects
   vm.objects = objPtr
   vm.bytesAllocated += sizeof(ObjHeader) + 32
-  if not vm.isCompiling and vm.bytesAllocated > vm.nextGC:
-    vm.collectGarbage()
 
 proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
   let fn = cast[ptr ObjFunction](alloc0(sizeof(ObjFunction)))
   fn.header = ObjHeader(kind: objFunction)
   fn.arity = 0
+  fn.upvalueCount = 0
   fn.name = name
   fn.chunk = Chunk(code: @[], constants: @[], lines: @[])
   vm[].trackObject(cast[pointer](fn))
   return fn
+
+proc newClosure*(vm: var VM, fn: ptr ObjFunction): ptr ObjClosure =
+  let closure = cast[ptr ObjClosure](alloc0(sizeof(ObjClosure)))
+  closure.header = ObjHeader(kind: objClosure)
+  closure.function = fn
+  closure.upvalueCount = fn.upvalueCount
+  if fn.upvalueCount > 0:
+    closure.upvalues = cast[ptr UncheckedArray[ptr ObjUpvalue]](alloc0(sizeof(ptr ObjUpvalue) * fn.upvalueCount))
+  vm.trackObject(cast[pointer](closure))
+  return closure
+
+proc newUpvalue*(vm: var VM, slot: ptr Value): ptr ObjUpvalue =
+  let upvalue = cast[ptr ObjUpvalue](alloc0(sizeof(ObjUpvalue)))
+  upvalue.header = ObjHeader(kind: objUpvalue)
+  upvalue.location = slot
+  upvalue.closed = valNil()
+  upvalue.next = nil
+  vm.trackObject(cast[pointer](upvalue))
+  return upvalue
+
+proc captureUpvalue*(vm: var VM, local: ptr Value): ptr ObjUpvalue =
+  var prevUpvalue: ptr ObjUpvalue = nil
+  var upvalue = vm.openUpvalues
+
+  while upvalue != nil and cast[uint64](upvalue.location) > cast[uint64](local):
+    prevUpvalue = upvalue
+    upvalue = upvalue.next
+
+  if upvalue != nil and upvalue.location == local:
+    return upvalue
+
+  let createdUpvalue = vm.newUpvalue(local)
+  createdUpvalue.next = upvalue
+
+  if prevUpvalue == nil:
+    vm.openUpvalues = createdUpvalue
+  else:
+    prevUpvalue.next = createdUpvalue
+
+  return createdUpvalue
+
+proc closeUpvalues*(vm: var VM, last: ptr Value) =
+  while vm.openUpvalues != nil and cast[uint64](vm.openUpvalues.location) >= cast[uint64](last):
+    let upvalue = vm.openUpvalues
+    upvalue.closed = upvalue.location[]
+    upvalue.location = addr upvalue.closed
+    vm.openUpvalues = upvalue.next
 
 proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
@@ -262,17 +334,32 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
     hash = hash xor uint8(c)
     hash = hash * 16777619'u32
 
-  var tempObj = ObjString(header: ObjHeader(kind: objString), strVal: str, hash: hash)
+  let tempSize = sizeof(ObjString) + str.len + 1
+  let tempBuf = alloc0(tempSize)
+  let tempObj = cast[ptr ObjString](tempBuf)
+  tempObj.header = ObjHeader(kind: objString)
+  tempObj.hash = hash
+  tempObj.length = str.len
+  if str.len > 0:
+    copyMem(addr tempObj.chars[0], unsafeAddr str[0], str.len)
+  tempObj.chars[str.len] = '\0'
+
   if vm.strings.entries != nil:
-    let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, addr tempObj)
+    let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, tempObj)
     if entry.key != nil:
+      dealloc(tempBuf)
       return valObj(entry.key)
 
-  let obj = cast[ptr ObjString](alloc0(sizeof(ObjString)))
+  dealloc(tempBuf)
+  let obj = cast[ptr ObjString](alloc0(tempSize))
   obj.header = ObjHeader(kind: objString)
-  obj.strVal = str
   obj.hash = hash
-  discard vm[].strings.tableSet(obj, valNil())
+  obj.length = str.len
+  if str.len > 0:
+    copyMem(addr obj.chars[0], unsafeAddr str[0], str.len)
+  obj.chars[str.len] = '\0'
+
+  discard vm[].strings.tableSet(obj, valBool(true))
   vm[].trackObject(cast[pointer](obj))
   return valObj(obj)
 
@@ -292,9 +379,7 @@ proc freeVM*(vm: var VM) =
     let nextObj = header.next
     case header.kind
     of objString:
-      let sObj = cast[ptr ObjString](current)
-      sObj.strVal = ""
-      dealloc(sObj)
+      dealloc(current)
     of objFunction:
       let fObj = cast[ptr ObjFunction](current)
       fObj.name = ""
@@ -302,6 +387,12 @@ proc freeVM*(vm: var VM) =
       fObj.chunk.constants = @[]
       fObj.chunk.lines = @[]
       dealloc(fObj)
+    of objClosure:
+      let cObj = cast[ptr ObjClosure](current)
+      if cObj.upvalues != nil: dealloc(cObj.upvalues)
+      dealloc(cObj)
+    of objUpvalue:
+      dealloc(current)
     of objNative:
       let nObj = cast[ptr ObjNative](current)
       nObj.name = ""
@@ -318,11 +409,12 @@ proc freeVM*(vm: var VM) =
   if vm.strings.entries != nil: dealloc(vm.strings.entries)
   vm.globals = FlatTable()
   vm.strings = FlatTable()
+  vm.openUpvalues = nil
   vm.resetStack()
 
-proc call*(vm: var VM, fn: ptr ObjFunction, argCount: int): bool =
-  if argCount != fn.arity:
-    vm.runtimeError("Expected " & $fn.arity & " arguments but got " & $argCount & ".")
+proc call*(vm: var VM, closure: ptr ObjClosure, argCount: int): bool =
+  if argCount != closure.function.arity:
+    vm.runtimeError("Expected " & $closure.function.arity & " arguments but got " & $argCount & ".")
     return false
 
   if vm.frameCount == FRAMES_MAX:
@@ -331,7 +423,7 @@ proc call*(vm: var VM, fn: ptr ObjFunction, argCount: int): bool =
 
   var frame = addr vm.frames[vm.frameCount]
   inc vm.frameCount
-  frame.fn = fn
+  frame.closure = closure
   frame.ip = 0
   frame.slots = vm.stackTop - argCount - 1
   return true
@@ -339,15 +431,20 @@ proc call*(vm: var VM, fn: ptr ObjFunction, argCount: int): bool =
 proc callValue*(vm: var VM, callee: Value, argCount: int): bool =
   if isObj(callee):
     case cast[ptr ObjHeader](asObj(callee)).kind
+    of objClosure:
+      return vm.call(asObjClosure(callee), argCount)
     of objFunction:
-      return vm.call(asObjFunction(callee), argCount)
+      let closure = vm.newClosure(asObjFunction(callee))
+      vm.stack[vm.stackTop - argCount - 1] = valObj(closure)
+      return vm.call(closure, argCount)
     of objNative:
       let nativeFn = asObjNative(callee)
-      let argsPtr = cast[ptr UncheckedArray[Value]](addr vm.stack[vm.stackTop - argCount])
+      let calleeSlot = vm.stackTop - argCount - 1
+      let argsPtr = cast[ptr UncheckedArray[Value]](addr vm.stack[calleeSlot + 1])
       let resVal = nativeFn.fn(addr vm, argCount, argsPtr)
-      if vm.stackTop == 0:
-        return false # Stack was reset due to runtime error
-      vm.stackTop -= argCount + 1
+      if vm.stackTop == 0 and calleeSlot < 0:
+        return false
+      vm.stackTop = calleeSlot
       vm.push(resVal)
       return true
     else: discard
@@ -356,18 +453,18 @@ proc callValue*(vm: var VM, callee: Value, argCount: int): bool =
   return false
 
 proc readByte*(frame: ptr CallFrame): uint8 =
-  result = frame.fn.chunk.code[frame.ip]
+  result = frame.closure.function.chunk.code[frame.ip]
   inc frame.ip
 
 proc readShort*(frame: ptr CallFrame): uint16 =
-  let high = uint16(frame.fn.chunk.code[frame.ip]) shl 8
-  let low = uint16(frame.fn.chunk.code[frame.ip + 1])
+  let high = uint16(frame.closure.function.chunk.code[frame.ip]) shl 8
+  let low = uint16(frame.closure.function.chunk.code[frame.ip + 1])
   frame.ip += 2
   return high or low
 
 proc readConstant*(frame: ptr CallFrame): Value =
   let index = frame.readByte()
-  return frame.fn.chunk.constants[int(index)]
+  return frame.closure.function.chunk.constants[int(index)]
 
 proc readString*(frame: ptr CallFrame): ptr ObjString =
   return asObjString(frame.readConstant())
@@ -410,6 +507,14 @@ proc run*(vm: var VM): InterpretResult =
       let slot = int(instruction) - int(opSetLocal0)
       vm.stack[frame.slots + slot] = vm.peek(0)
 
+    of opGetUpvalue:
+      let slot = frame.readByte()
+      vm.push(frame.closure.upvalues[slot].location[])
+
+    of opSetUpvalue:
+      let slot = frame.readByte()
+      frame.closure.upvalues[slot].location[] = vm.peek(0)
+
     of opDefineGlobal:
       let nameObj = frame.readString()
       discard vm.globals.tableSet(nameObj, vm.pop())
@@ -418,7 +523,7 @@ proc run*(vm: var VM): InterpretResult =
       let nameObj = frame.readString()
       var val: Value
       if not tableGet(addr vm.globals, nameObj, val):
-        vm.runtimeError("Undefined variable '" & nameObj.strVal & "'.")
+        vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
       vm.push(val)
 
@@ -426,7 +531,7 @@ proc run*(vm: var VM): InterpretResult =
       let nameObj = frame.readString()
       var val: Value
       if not tableGet(addr vm.globals, nameObj, val):
-        vm.runtimeError("Undefined variable '" & nameObj.strVal & "'.")
+        vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
       discard vm.globals.tableSet(nameObj, vm.peek(0))
 
@@ -441,7 +546,7 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.push(valBool(asNum(a) > asNum(b)))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.push(valBool(asObjString(a).strVal > asObjString(b).strVal))
+        vm.push(valBool(getString(asObjString(a)) > getString(asObjString(b))))
       else:
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
@@ -452,7 +557,7 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.push(valBool(asNum(a) < asNum(b)))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.push(valBool(asObjString(a).strVal < asObjString(b).strVal))
+        vm.push(valBool(getString(asObjString(a)) < getString(asObjString(b))))
       else:
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
@@ -463,7 +568,7 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.push(valNum(asNum(a) + asNum(b)))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        let concatStr = asObjString(a).strVal & asObjString(b).strVal
+        let concatStr = getString(asObjString(a)) & getString(asObjString(b))
         let strVal = internStringImpl(addr vm, concatStr)
         vm.push(strVal)
       else:
@@ -533,8 +638,25 @@ proc run*(vm: var VM): InterpretResult =
         return irRuntimeError
       frame = addr vm.frames[vm.frameCount - 1]
 
+    of opClosure:
+      let fn = asObjFunction(frame.readConstant())
+      let closure = vm.newClosure(fn)
+      vm.push(valObj(closure))
+      for i in 0 ..< closure.upvalueCount:
+        let isLocal = frame.readByte() == 1'u8
+        let index = int(frame.readByte())
+        if isLocal:
+          closure.upvalues[i] = vm.captureUpvalue(addr vm.stack[frame.slots + index])
+        else:
+          closure.upvalues[i] = frame.closure.upvalues[index]
+
+    of opCloseUpvalue:
+      vm.closeUpvalues(addr vm.stack[vm.stackTop - 1])
+      discard vm.pop()
+
     of opReturn:
       let resVal = vm.pop()
+      vm.closeUpvalues(addr vm.stack[frame.slots])
       dec vm.frameCount
       if vm.frameCount == 0:
         vm.stackTop = frame.slots
@@ -552,6 +674,7 @@ proc interpret*(vm: var VM, source: string): InterpretResult =
   if scriptFn == nil:
     return irCompileError
 
-  vm.push(valObj(scriptFn))
-  discard vm.call(scriptFn, 0)
+  let scriptClosure = vm.newClosure(scriptFn)
+  vm.push(valObj(scriptClosure))
+  discard vm.call(scriptClosure, 0)
   return vm.run()

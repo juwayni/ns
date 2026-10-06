@@ -4,7 +4,7 @@ import compiler, vm
 import std/macros
 import std/dynlib
 import std/[math, os, strutils]
-export compiler.Value, compiler.ObjKind, compiler.isNum, compiler.isBool, compiler.isObjKind, compiler.asNum, compiler.asBool, compiler.asObjString, compiler.asObjUserData, compiler.valNil, compiler.valNum, compiler.valBool, compiler.valObj, vm.InterpretResult, vm.VM
+export compiler.Value, compiler.ObjKind, compiler.isNum, compiler.isBool, compiler.isObjKind, compiler.asNum, compiler.asBool, compiler.asObjString, compiler.asObjUserData, compiler.getString, compiler.valNil, compiler.valNum, compiler.valBool, compiler.valObj, vm.InterpretResult, vm.VM
 
 proc runScript*(source: string): InterpretResult =
   var vm = initVM()
@@ -64,15 +64,15 @@ macro exposeProc*(vm: var VM, procSym: typed): untyped =
       elif eqIdent(paramType, "string"):
         unpackList.add quote do:
           if not isObjKind(`argsIdent`[`idx`], objString): return valNil()
-          let `paramIdent` = asObjString(`argsIdent`[`idx`]).strVal
+          let `paramIdent` = getString(asObjString(`argsIdent`[`idx`]))
       elif eqIdent(paramType, "bool"):
         unpackList.add quote do:
           if not isBool(`argsIdent`[`idx`]): return valNil()
           let `paramIdent` = asBool(`argsIdent`[`idx`])
       elif eqIdent(paramType, "char"):
         unpackList.add quote do:
-          if not isObjKind(`argsIdent`[`idx`], objString) or asObjString(`argsIdent`[`idx`]).strVal.len == 0: return valNil()
-          let `paramIdent` = asObjString(`argsIdent`[`idx`]).strVal[0]
+          if not isObjKind(`argsIdent`[`idx`], objString) or asObjString(`argsIdent`[`idx`]).length == 0: return valNil()
+          let `paramIdent` = getString(asObjString(`argsIdent`[`idx`]))[0]
 
       rawCall.add(paramIdent)
 
@@ -118,7 +118,7 @@ proc nativeFFILoad*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]):
   if argc < 1 or not isObjKind(args[0], objString):
     return valNil()
 
-  let symName = asObjString(args[0]).strVal
+  let symName = getString(asObjString(args[0]))
   let handle = loadLib()
   if handle == nil:
     vm[].runtimeError("Could not open executable handle for FFI symbol lookup.")
@@ -154,7 +154,7 @@ proc nativeFFICall*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]):
       let res = cast[Fn1F](fnPtr)(asNum(args[1]))
       return valNum(res)
     elif isObjKind(args[1], objString):
-      let strVal = asObjString(args[1]).strVal
+      let strVal = getString(asObjString(args[1]))
       type Fn1S = proc(s: cstring): int32 {.cdecl.}
       let res = cast[Fn1S](fnPtr)(strVal.cstring)
       return valNum(float64(res))
