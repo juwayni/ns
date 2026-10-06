@@ -114,7 +114,7 @@ proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr 
     elif entry.key == key:
       return entry
     elif entry.key.hash == key.hash and entry.key.length == key.length:
-      if key.length == 0 or equalMem(addr entry.key.chars[0], addr key.chars[0], key.length):
+      if key.length == 0 or equalMem(cast[pointer](chars(entry.key)), cast[pointer](chars(key)), key.length):
         return entry
     index = (index + 1) and capacityMask
   return if tombstone != nil: tombstone else: addr entries[0]
@@ -339,10 +339,10 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
   let tempObj = cast[ptr ObjString](tempBuf)
   tempObj.header = ObjHeader(kind: objString)
   tempObj.hash = hash
-  tempObj.length = str.len
+  tempObj.length = int32(str.len)
   if str.len > 0:
-    copyMem(addr tempObj.chars[0], unsafeAddr str[0], str.len)
-  tempObj.chars[str.len] = '\0'
+    copyMem(cast[pointer](chars(tempObj)), unsafeAddr str[0], str.len)
+  cast[ptr char](cast[uint](chars(tempObj)) + str.len.uint)[] = '\0'
 
   if vm.strings.entries != nil:
     let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, tempObj)
@@ -354,10 +354,10 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
   let obj = cast[ptr ObjString](alloc0(tempSize))
   obj.header = ObjHeader(kind: objString)
   obj.hash = hash
-  obj.length = str.len
+  obj.length = int32(str.len)
   if str.len > 0:
-    copyMem(addr obj.chars[0], unsafeAddr str[0], str.len)
-  obj.chars[str.len] = '\0'
+    copyMem(cast[pointer](chars(obj)), unsafeAddr str[0], str.len)
+  cast[ptr char](cast[uint](chars(obj)) + str.len.uint)[] = '\0'
 
   discard vm[].strings.tableSet(obj, valBool(true))
   vm[].trackObject(cast[pointer](obj))

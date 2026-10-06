@@ -1,4 +1,4 @@
-## compiler.nim - Single-Allocation ObjString, Lexical Closures & Pratt Parser
+## compiler.nim - Flexible-Array Single-Allocation ObjString, Lexical Closures & Pratt Parser
 
 import lexer
 
@@ -50,13 +50,20 @@ type
     isMarked*: bool
     next*: pointer # Linked list for GC sweep
 
-  # Flexible array single allocation: sizeof(ObjHeader) + 4 + 4 + N + 1
+  # Pure C-style flexible array payload layout: sizeof(ObjString) = 24 bytes
   ObjString* = object
     header*: ObjHeader
     hash*: uint32
-    length*: int
-    chars*: UncheckedArray[char]
+    length*: int32
 
+template chars*(strObj: ptr ObjString): cstring =
+  cast[cstring](cast[uint](strObj) + sizeof(ObjString).uint)
+
+proc getString*(strObj: ptr ObjString): string =
+  if strObj == nil or strObj.length == 0: return ""
+  return $chars(strObj)
+
+type
   Chunk* = object
     code*: seq[uint8]
     constants*: seq[Value]
@@ -117,11 +124,6 @@ proc asObjNative*(v: Value): ptr ObjNative =
 
 proc asObjUserData*(v: Value): ptr ObjUserData =
   cast[ptr ObjUserData](asObj(v))
-
-proc getString*(strObj: ptr ObjString): string =
-  if strObj == nil or strObj.length == 0: return ""
-  result = newString(strObj.length)
-  copyMem(addr result[0], addr strObj.chars[0], strObj.length)
 
 proc `==`*(a, b: Value): bool =
   uint64(a) == uint64(b)
