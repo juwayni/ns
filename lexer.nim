@@ -10,7 +10,7 @@ type
     tkPlus, tkMinus, tkStar, tkSlash,
     tkAssign, tkEq, tkBang, tkNotEq,
     tkLt, tkLtEq, tkGt, tkGtEq,
-    tkLParen, tkRParen, tkLBrace, tkRBrace,
+    tkLParen, tkRParen, tkLBrace, tkRBrace, tkLBracket, tkRBracket,
     tkComma, tkSemicolon,
 
     # Literals
@@ -216,6 +216,8 @@ proc nextToken*(lexer: var Lexer): Token =
   of ')': return lexer.makeToken(tkRParen)
   of '{': return lexer.makeToken(tkLBrace)
   of '}': return lexer.makeToken(tkRBrace)
+  of '[': return lexer.makeToken(tkLBracket)
+  of ']': return lexer.makeToken(tkRBracket)
   of ',': return lexer.makeToken(tkComma)
   of ';': return lexer.makeToken(tkSemicolon)
   of '+': return lexer.makeToken(tkPlus)

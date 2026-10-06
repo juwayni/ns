@@ -1,4 +1,4 @@
-## compiler.nim - Flexible-Array Single-Allocation ObjString, Lexical Closures & Pratt Parser
+## compiler.nim - Flexible-Array ObjString, Arrays, Lexical Closures & Pratt Parser
 
 import lexer
 
@@ -43,14 +43,14 @@ type
     objClosure,
     objUpvalue,
     objNative,
-    objUserData
+    objUserData,
+    objArray
 
   ObjHeader* = object
     kind*: ObjKind
     isMarked*: bool
     next*: pointer # Linked list for GC sweep
 
-  # Pure C-style flexible array payload layout: sizeof(ObjString) = 24 bytes
   ObjString* = object
     header*: ObjHeader
     hash*: uint32
@@ -88,6 +88,10 @@ type
     upvalues*: ptr UncheckedArray[ptr ObjUpvalue]
     upvalueCount*: int
 
+  ObjArray* = object
+    header*: ObjHeader
+    elements*: seq[Value]
+
   NativeFn* = proc(vm: pointer, argc: int, args: ptr UncheckedArray[Value]): Value {.nimcall.}
 
   ObjNative* = object
@@ -118,6 +122,9 @@ proc asObjClosure*(v: Value): ptr ObjClosure =
 
 proc asObjUpvalue*(v: Value): ptr ObjUpvalue =
   cast[ptr ObjUpvalue](asObj(v))
+
+proc asObjArray*(v: Value): ptr ObjArray =
+  cast[ptr ObjArray](asObj(v))
 
 proc asObjNative*(v: Value): ptr ObjNative =
   cast[ptr ObjNative](asObj(v))
@@ -152,6 +159,14 @@ proc `$`*(v: Value): string =
       if fn.name.len == 0: return "<script>"
       else: return "<fn " & fn.name & ">"
     of objUpvalue: return "<upvalue>"
+    of objArray:
+      let arr = asObjArray(v)
+      result = "["
+      for i, elem in arr.elements:
+        if i > 0: result.add(", ")
+        result.add($elem)
+      result.add("]")
+      return result
     of objNative: return "<native fn " & asObjNative(v).name & ">"
     of objUserData: return "<userdata>"
   return "<unknown>"
@@ -198,6 +213,9 @@ type
     opCall,
     opClosure,
     opCloseUpvalue,
+    opBuildArray,
+    opGetIndex,
+    opSetIndex,
     opReturn
 
 # --------------------------------------------------
@@ -215,7 +233,7 @@ type
     precTerm,       # + -
     precFactor,     # * /
     precUnary,      # ! -
-    precCall,       # . ()
+    precCall,       # . () []
     precPrimary
 
   ParseFn* = proc(compiler: var Compiler, canAssign: bool)
@@ -405,6 +423,27 @@ proc grouping*(compiler: var Compiler, canAssign: bool) =
   compiler.expression()
   compiler.consume(tkRParen, "Expect ')' after expression.")
 
+proc arrayLiteral*(compiler: var Compiler, canAssign: bool) =
+  var count: uint8 = 0
+  if not compiler.check(tkRBracket):
+    while true:
+      compiler.expression()
+      if count == 255:
+        compiler.error("Cannot have more than 255 elements in array literal.")
+      inc count
+      if not compiler.match(tkComma): break
+  compiler.consume(tkRBracket, "Expect ']' after array elements.")
+  compiler.emitOpAndByte(opBuildArray, count)
+
+proc subscript*(compiler: var Compiler, canAssign: bool) =
+  compiler.expression()
+  compiler.consume(tkRBracket, "Expect ']' after index.")
+  if canAssign and compiler.match(tkAssign):
+    compiler.expression()
+    compiler.emitOp(opSetIndex)
+  else:
+    compiler.emitOp(opGetIndex)
+
 proc unary*(compiler: var Compiler, canAssign: bool) =
   let operatorKind = compiler.previous.kind
   compiler.parsePrecedence(precUnary)
@@ -562,6 +601,7 @@ proc parsePrecedence*(compiler: var Compiler, precedence: Precedence) =
 proc getRule*(kind: TokenType): ParseRule =
   case kind
   of tkLParen: ParseRule(prefix: grouping, infix: call, precedence: precCall)
+  of tkLBracket: ParseRule(prefix: arrayLiteral, infix: subscript, precedence: precCall)
   of tkMinus: ParseRule(prefix: unary, infix: binary, precedence: precTerm)
   of tkPlus: ParseRule(prefix: nil, infix: binary, precedence: precTerm)
   of tkSlash: ParseRule(prefix: nil, infix: binary, precedence: precFactor)

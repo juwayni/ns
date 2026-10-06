@@ -1,4 +1,4 @@
-## vm.nim - High-Performance CallFrame, FlatTable, Lexical Closures & Mark-Sweep VM
+## vm.nim - High-Performance CallFrame, FlatTable, Lexical Closures, Packed Arrays & Mark-Sweep VM
 
 import compiler
 
@@ -170,6 +170,10 @@ proc blackenObject*(vm: var VM, objPtr: pointer) =
   let header = cast[ptr ObjHeader](objPtr)
   case header.kind
   of objString, objNative, objUserData: discard
+  of objArray:
+    let arr = cast[ptr ObjArray](objPtr)
+    for elem in arr.elements:
+      vm.markValue(elem)
   of objUpvalue:
     vm.markValue(cast[ptr ObjUpvalue](objPtr).closed)
   of objFunction:
@@ -238,6 +242,10 @@ proc collectGarbage*(vm: var VM) =
       case header.kind
       of objString:
         dealloc(unreached)
+      of objArray:
+        let arr = cast[ptr ObjArray](unreached)
+        arr.elements = @[]
+        dealloc(arr)
       of objFunction:
         let fObj = cast[ptr ObjFunction](unreached)
         fObj.name = ""
@@ -336,7 +344,6 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
     hash = hash xor uint8(c)
     hash = hash * 16777619'u32
 
-  # Stack buffer for small strings up to 128 bytes to eliminate heap churn on lookups
   var stackBuf: array[160, byte]
   let tempSize = sizeof(ObjString) + str.len + 1
   let useHeap = tempSize > sizeof(stackBuf)
@@ -387,6 +394,10 @@ proc freeVM*(vm: var VM) =
     case header.kind
     of objString:
       dealloc(current)
+    of objArray:
+      let arr = cast[ptr ObjArray](current)
+      arr.elements = @[]
+      dealloc(arr)
     of objFunction:
       let fObj = cast[ptr ObjFunction](current)
       fObj.name = ""
@@ -661,6 +672,44 @@ proc run*(vm: var VM): InterpretResult =
     of opCloseUpvalue:
       vm.closeUpvalues(addr vm.stack[vm.stackTop - 1])
       discard vm.pop()
+
+    of opBuildArray:
+      let count = int(frame.readByte())
+      let arrObj = cast[ptr ObjArray](alloc0(sizeof(ObjArray)))
+      arrObj.header = ObjHeader(kind: objArray)
+      arrObj.elements = newSeq[Value](count)
+      for i in countdown(count - 1, 0):
+        arrObj.elements[i] = vm.pop()
+      vm.trackObject(cast[pointer](arrObj))
+      vm.push(valObj(arrObj))
+
+    of opGetIndex:
+      let indexVal = vm.pop()
+      let containerVal = vm.pop()
+      if not isNum(indexVal) or not isObjKind(containerVal, objArray):
+        vm.runtimeError("Subscript index must be a number on an array.")
+        return irRuntimeError
+      let idx = int(asNum(indexVal))
+      let arr = cast[ptr ObjArray](asObj(containerVal))
+      if idx < 0 or idx >= arr.elements.len:
+        vm.runtimeError("Array index out of bounds: " & $idx)
+        return irRuntimeError
+      vm.push(arr.elements[idx])
+
+    of opSetIndex:
+      let val = vm.pop()
+      let indexVal = vm.pop()
+      let containerVal = vm.pop()
+      if not isNum(indexVal) or not isObjKind(containerVal, objArray):
+        vm.runtimeError("Subscript index must be a number on an array.")
+        return irRuntimeError
+      let idx = int(asNum(indexVal))
+      let arr = cast[ptr ObjArray](asObj(containerVal))
+      if idx < 0 or idx >= arr.elements.len:
+        vm.runtimeError("Array index out of bounds: " & $idx)
+        return irRuntimeError
+      arr.elements[idx] = val
+      vm.push(val)
 
     of opReturn:
       let resVal = vm.pop()
