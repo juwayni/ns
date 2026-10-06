@@ -268,6 +268,8 @@ proc trackObject*(vm: var VM, objPtr: pointer) =
   header.next = vm.objects
   vm.objects = objPtr
   vm.bytesAllocated += sizeof(ObjHeader) + 32
+  if not vm.isCompiling and vm.bytesAllocated > vm.nextGC:
+    vm.collectGarbage()
 
 proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
@@ -334,8 +336,12 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
     hash = hash xor uint8(c)
     hash = hash * 16777619'u32
 
+  # Stack buffer for small strings up to 128 bytes to eliminate heap churn on lookups
+  var stackBuf: array[160, byte]
   let tempSize = sizeof(ObjString) + str.len + 1
-  let tempBuf = alloc0(tempSize)
+  let useHeap = tempSize > sizeof(stackBuf)
+  let tempBuf = if useHeap: alloc0(tempSize) else: addr stackBuf[0]
+
   let tempObj = cast[ptr ObjString](tempBuf)
   tempObj.header = ObjHeader(kind: objString)
   tempObj.hash = hash
@@ -347,10 +353,11 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
   if vm.strings.entries != nil:
     let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, tempObj)
     if entry.key != nil:
-      dealloc(tempBuf)
+      if useHeap: dealloc(tempBuf)
       return valObj(entry.key)
 
-  dealloc(tempBuf)
+  if useHeap: dealloc(tempBuf)
+
   let obj = cast[ptr ObjString](alloc0(tempSize))
   obj.header = ObjHeader(kind: objString)
   obj.hash = hash
@@ -470,6 +477,7 @@ proc readString*(frame: ptr CallFrame): ptr ObjString =
   return asObjString(frame.readConstant())
 
 proc run*(vm: var VM): InterpretResult =
+  let targetFrameCount = vm.frameCount - 1
   var frame = addr vm.frames[vm.frameCount - 1]
 
   while true:
@@ -658,7 +666,7 @@ proc run*(vm: var VM): InterpretResult =
       let resVal = vm.pop()
       vm.closeUpvalues(addr vm.stack[frame.slots])
       dec vm.frameCount
-      if vm.frameCount == 0:
+      if vm.frameCount == targetFrameCount:
         vm.stackTop = frame.slots
         vm.push(resVal)
         return irOk

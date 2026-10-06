@@ -163,6 +163,12 @@ proc nativeFFICall*(vmPtr: pointer, argc: int, args: ptr UncheckedArray[Value]):
       type Fn2F = proc(a, b: float64): float64 {.cdecl.}
       let res = cast[Fn2F](fnPtr)(asNum(args[1]), asNum(args[2]))
       return valNum(res)
+    elif isObjKind(args[1], objString) and isObjKind(args[2], objString):
+      let str1 = getString(asObjString(args[1]))
+      let str2 = getString(asObjString(args[2]))
+      type Fn2S = proc(a, b: cstring): int32 {.cdecl.}
+      let res = cast[Fn2S](fnPtr)(str1.cstring, str2.cstring)
+      return valNum(float64(res))
 
   return valNil()
 
