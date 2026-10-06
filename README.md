@@ -27,16 +27,16 @@ Below are exact, honest execution times collected on Linux x86-64 comparing Nim 
 
 | # | Benchmark Test Case | Iterations / Workload | Nim Engine (s) | Lua 5.4 (s) |
 | :---: | :--- | :--- | :---: | :---: |
-| **01** | Loop Reduction | 10,000,000 while loop iterations | `0.7492s` | `0.1478s` |
-| **02** | Recursive Fibonacci | `fib(28)` call frame recursion | `0.0576s` | `0.0319s` |
-| **03** | Lexical Closures | 1,000,000 upvalue closure calls | `0.1086s` | `0.0398s` |
-| **04** | Packed Array Access | 500,000 element writes & indexing | `0.0481s` | `0.0151s` |
-| **05** | Nested Loops | 1,000 x 1,000 2D loop iterations | `0.0501s` | `0.0141s` |
-| **06** | String Concatenation | 50,000 interned string additions | `10.5598s` | `0.1100s` |
-| **07** | Conditional Branching | 5,000,000 condition evaluations | `0.5220s` | `0.1015s` |
-| **08** | Function Call Overhead | 1,000,000 function calls & returns | `0.0962s` | `0.0342s` |
-| **09** | Prime Checking Sieve | N=10,000 prime checking loops | `0.0573s` | `0.0228s` |
-| **10** | Global Variable Access | 2,000,000 FlatTable lookups | `0.1437s` | `0.0497s` |
+| **01** | Loop Reduction | 10,000,000 while loop iterations | `0.7588s` | `0.1455s` |
+| **02** | Recursive Fibonacci | `fib(28)` call frame recursion | `0.0578s` | `0.0314s` |
+| **03** | Lexical Closures | 1,000,000 upvalue closure calls | `0.1039s` | `0.0427s` |
+| **04** | Packed Array Access | 500,000 element writes & indexing | `0.0488s` | `0.0154s` |
+| **05** | Nested Loops | 1,000 x 1,000 2D loop iterations | `0.0535s` | `0.0162s` |
+| **06** | String Concatenation | 50,000 interned string additions | `14.6043s` | `0.1097s` |
+| **07** | Conditional Branching | 5,000,000 condition evaluations | `0.5693s` | `0.1031s` |
+| **08** | Function Call Overhead | 1,000,000 function calls & returns | `0.0984s` | `0.0346s` |
+| **09** | Prime Checking Sieve | N=10,000 prime checking loops | `0.0567s` | `0.0232s` |
+| **10** | Global Variable Access | 2,000,000 FlatTable lookups | `0.1435s` | `0.0576s` |
 
 > **Takeaway**: With direct-threaded computed goto dispatch and register-cached stack pointers, Nim Script Engine delivers **sub-100ms execution times** for function call overhead (`0.0962s`), recursive Fibonacci (`0.0576s`), prime sieve checking (`0.0573s`), and packed array access (`0.0481s`), while maintaining an **85% smaller binary footprint (~39 KB vs 300+ KB)** and **50% smaller value memory layout (8 bytes vs 16 bytes)**.
 
