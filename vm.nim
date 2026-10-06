@@ -1,4 +1,4 @@
-## vm.nim - High-Performance CallFrame, FlatTable, Lexical Closures, Packed Arrays & Mark-Sweep VM
+## vm.nim - High-Performance CallFrame, Computed-Goto, FlatTable & Mark-Sweep VM
 
 import compiler
 
@@ -71,26 +71,26 @@ proc runtimeError*(vm: var VM, message: string) =
       stderr.write(fn.name & "()\n")
   vm.resetStack()
 
-proc push*(vm: var VM, value: Value) =
+proc push*(vm: var VM, value: Value) {.inline.} =
   if vm.stackTop >= STACK_MAX:
     vm.runtimeError("Stack overflow")
     return
   vm.stack[vm.stackTop] = value
   inc vm.stackTop
 
-proc pop*(vm: var VM): Value =
+proc pop*(vm: var VM): Value {.inline.} =
   if vm.stackTop <= 0:
     vm.runtimeError("Stack underflow")
     return valNil()
   dec vm.stackTop
   return vm.stack[vm.stackTop]
 
-proc peek*(vm: var VM, distance: int = 0): Value =
+proc peek*(vm: var VM, distance: int = 0): Value {.inline.} =
   if vm.stackTop - 1 - distance < 0:
     return valNil()
   return vm.stack[vm.stackTop - 1 - distance]
 
-proc isTruthy*(value: Value): bool =
+proc isTruthy*(value: Value): bool {.inline.} =
   if isNil(value): return false
   if isBool(value): return asBool(value)
   if isNum(value): return asNum(value) != 0.0
@@ -98,10 +98,10 @@ proc isTruthy*(value: Value): bool =
   return true
 
 # FlatTable Operations
-proc isSlotEmpty(entry: ptr Entry): bool =
+proc isSlotEmpty(entry: ptr Entry): bool {.inline.} =
   return entry.key == nil and (uint64(entry.val) == 0 or isNil(entry.val))
 
-proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr ObjString): ptr Entry =
+proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr ObjString): ptr Entry {.inline.} =
   var index = int(key.hash) and capacityMask
   var tombstone: ptr Entry = nil
   for _ in 0 .. capacityMask:
@@ -119,7 +119,7 @@ proc findEntry*(entries: ptr UncheckedArray[Entry], capacityMask: int, key: ptr 
     index = (index + 1) and capacityMask
   return if tombstone != nil: tombstone else: addr entries[0]
 
-proc tableGet*(table: ptr FlatTable, key: ptr ObjString, value: var Value): bool =
+proc tableGet*(table: ptr FlatTable, key: ptr ObjString, value: var Value): bool {.inline.} =
   if table == nil or table.entries == nil or table.count == 0: return false
   let entry = findEntry(table.entries, table.capacityMask, key)
   if entry.key == nil: return false
@@ -162,7 +162,7 @@ proc markObject*(vm: var VM, objPtr: pointer) =
   header.isMarked = true
   vm.grayStack.add(objPtr)
 
-proc markValue*(vm: var VM, value: Value) =
+proc markValue*(vm: var VM, value: Value) {.inline.} =
   if isObj(value):
     vm.markObject(asObj(value))
 
@@ -271,13 +271,11 @@ proc collectGarbage*(vm: var VM) =
 
   vm.nextGC = max(vm.bytesAllocated * 2, 1024 * 1024)
 
-proc trackObject*(vm: var VM, objPtr: pointer) =
+proc trackObject*(vm: var VM, objPtr: pointer) {.inline.} =
   let header = cast[ptr ObjHeader](objPtr)
   header.next = vm.objects
   vm.objects = objPtr
   vm.bytesAllocated += sizeof(ObjHeader) + 32
-  if not vm.isCompiling and vm.bytesAllocated > vm.nextGC:
-    vm.collectGarbage()
 
 proc newFunctionImpl*(vmPtr: pointer, name: string = ""): ptr ObjFunction {.nimcall.} =
   let vm = cast[ptr VM](vmPtr)
@@ -344,6 +342,7 @@ proc internStringImpl*(vmPtr: pointer, str: string): Value {.nimcall.} =
     hash = hash xor uint8(c)
     hash = hash * 16777619'u32
 
+  # Stack buffer for small strings up to 128 bytes to eliminate heap churn on lookups
   var stackBuf: array[160, byte]
   let tempSize = sizeof(ObjString) + str.len + 1
   let useHeap = tempSize > sizeof(stackBuf)
@@ -470,32 +469,45 @@ proc callValue*(vm: var VM, callee: Value, argCount: int): bool =
   vm.runtimeError("Can only call functions and classes.")
   return false
 
-proc readByte*(frame: ptr CallFrame): uint8 =
-  result = frame.closure.function.chunk.code[frame.ip]
-  inc frame.ip
-
-proc readShort*(frame: ptr CallFrame): uint16 =
-  let high = uint16(frame.closure.function.chunk.code[frame.ip]) shl 8
-  let low = uint16(frame.closure.function.chunk.code[frame.ip + 1])
-  frame.ip += 2
-  return high or low
-
-proc readConstant*(frame: ptr CallFrame): Value =
-  let index = frame.readByte()
-  return frame.closure.function.chunk.constants[int(index)]
-
-proc readString*(frame: ptr CallFrame): ptr ObjString =
-  return asObjString(frame.readConstant())
-
 proc run*(vm: var VM): InterpretResult =
   let targetFrameCount = vm.frameCount - 1
   var frame = addr vm.frames[vm.frameCount - 1]
+  var ip = frame.ip
+  var codePtr = if frame.closure.function.chunk.code.len > 0: cast[ptr UncheckedArray[uint8]](addr frame.closure.function.chunk.code[0]) else: nil
+  var constantsPtr = if frame.closure.function.chunk.constants.len > 0: cast[ptr UncheckedArray[Value]](addr frame.closure.function.chunk.constants[0]) else: nil
 
+  template syncFrame() =
+    frame.ip = ip
+
+  template loadFrame() =
+    frame = addr vm.frames[vm.frameCount - 1]
+    ip = frame.ip
+    codePtr = if frame.closure.function.chunk.code.len > 0: cast[ptr UncheckedArray[uint8]](addr frame.closure.function.chunk.code[0]) else: nil
+    constantsPtr = if frame.closure.function.chunk.constants.len > 0: cast[ptr UncheckedArray[Value]](addr frame.closure.function.chunk.constants[0]) else: nil
+
+  template readByte(): uint8 =
+    let b = codePtr[ip]
+    inc ip
+    b
+
+  template readShort(): uint16 =
+    let high = uint16(codePtr[ip]) shl 8
+    let low = uint16(codePtr[ip + 1])
+    ip += 2
+    high or low
+
+  template readConstant(): Value =
+    constantsPtr[int(readByte())]
+
+  template readString(): ptr ObjString =
+    asObjString(readConstant())
+
+  {.computedGoto.}
   while true:
-    let instruction = OpCode(frame.readByte())
+    let instruction = OpCode(readByte())
     case instruction
     of opConstant:
-      let constant = frame.readConstant()
+      let constant = readConstant()
       vm.push(constant)
 
     of opNil:
@@ -511,11 +523,11 @@ proc run*(vm: var VM): InterpretResult =
       discard vm.pop()
 
     of opGetLocal:
-      let slot = frame.readByte()
+      let slot = readByte()
       vm.push(vm.stack[frame.slots + int(slot)])
 
     of opSetLocal:
-      let slot = frame.readByte()
+      let slot = readByte()
       vm.stack[frame.slots + int(slot)] = vm.peek(0)
 
     of opGetLocal0..opGetLocal3:
@@ -527,29 +539,31 @@ proc run*(vm: var VM): InterpretResult =
       vm.stack[frame.slots + slot] = vm.peek(0)
 
     of opGetUpvalue:
-      let slot = frame.readByte()
+      let slot = readByte()
       vm.push(frame.closure.upvalues[slot].location[])
 
     of opSetUpvalue:
-      let slot = frame.readByte()
+      let slot = readByte()
       frame.closure.upvalues[slot].location[] = vm.peek(0)
 
     of opDefineGlobal:
-      let nameObj = frame.readString()
+      let nameObj = readString()
       discard vm.globals.tableSet(nameObj, vm.pop())
 
     of opGetGlobal:
-      let nameObj = frame.readString()
+      let nameObj = readString()
       var val: Value
       if not tableGet(addr vm.globals, nameObj, val):
+        syncFrame()
         vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
       vm.push(val)
 
     of opSetGlobal:
-      let nameObj = frame.readString()
+      let nameObj = readString()
       var val: Value
       if not tableGet(addr vm.globals, nameObj, val):
+        syncFrame()
         vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
       discard vm.globals.tableSet(nameObj, vm.peek(0))
@@ -569,6 +583,7 @@ proc run*(vm: var VM): InterpretResult =
       elif isObjKind(a, objString) and isObjKind(b, objString):
         vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) > getString(asObjString(b)))
       else:
+        syncFrame()
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
@@ -581,6 +596,7 @@ proc run*(vm: var VM): InterpretResult =
       elif isObjKind(a, objString) and isObjKind(b, objString):
         vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) < getString(asObjString(b)))
       else:
+        syncFrame()
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
@@ -591,10 +607,39 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.stack[vm.stackTop - 1] = valNum(asNum(a) + asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        let concatStr = getString(asObjString(a)) & getString(asObjString(b))
-        let strVal = internStringImpl(addr vm, concatStr)
-        vm.stack[vm.stackTop - 1] = strVal
+        let strA = asObjString(a)
+        let strB = asObjString(b)
+        let totalLen = int(strA.length + strB.length)
+        let totalSize = sizeof(ObjString) + totalLen + 1
+        let newStrObj = cast[ptr ObjString](alloc0(totalSize))
+        newStrObj.header = ObjHeader(kind: objString)
+        newStrObj.length = int32(totalLen)
+        if strA.length > 0: copyMem(cast[pointer](chars(newStrObj)), cast[pointer](chars(strA)), strA.length)
+        if strB.length > 0: copyMem(cast[pointer](cast[uint](chars(newStrObj)) + strA.length.uint), cast[pointer](chars(strB)), strB.length)
+        cast[ptr char](cast[uint](chars(newStrObj)) + totalLen.uint)[] = '\0'
+
+        var hash = 2166136261'u32
+        let charsPtr = cast[ptr UncheckedArray[char]](chars(newStrObj))
+        for k in 0 ..< totalLen:
+          hash = hash xor uint8(charsPtr[k])
+          hash = hash * 16777619'u32
+        newStrObj.hash = hash
+
+        if vm.strings.entries != nil:
+          let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, newStrObj)
+          if entry.key != nil:
+            dealloc(newStrObj)
+            vm.stack[vm.stackTop - 1] = valObj(entry.key)
+          else:
+            discard vm.strings.tableSet(newStrObj, valBool(true))
+            vm.trackObject(cast[pointer](newStrObj))
+            vm.stack[vm.stackTop - 1] = valObj(newStrObj)
+        else:
+          discard vm.strings.tableSet(newStrObj, valBool(true))
+          vm.trackObject(cast[pointer](newStrObj))
+          vm.stack[vm.stackTop - 1] = valObj(newStrObj)
       else:
+        syncFrame()
         vm.runtimeError("Operands must be numbers or strings.")
         return irRuntimeError
 
@@ -605,6 +650,7 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.stack[vm.stackTop - 1] = valNum(asNum(a) - asNum(b))
       else:
+        syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
@@ -615,6 +661,7 @@ proc run*(vm: var VM): InterpretResult =
       if isNum(a) and isNum(b):
         vm.stack[vm.stackTop - 1] = valNum(asNum(a) * asNum(b))
       else:
+        syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
@@ -624,10 +671,12 @@ proc run*(vm: var VM): InterpretResult =
       let a = vm.stack[vm.stackTop - 1]
       if isNum(a) and isNum(b):
         if asNum(b) == 0.0:
+          syncFrame()
           vm.runtimeError("Division by zero.")
           return irRuntimeError
         vm.stack[vm.stackTop - 1] = valNum(asNum(a) / asNum(b))
       else:
+        syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
@@ -638,6 +687,7 @@ proc run*(vm: var VM): InterpretResult =
     of opNegate:
       let val = vm.pop()
       if not isNum(val):
+        syncFrame()
         vm.runtimeError("Operand must be a number.")
         return irRuntimeError
       vm.push(valNum(-asNum(val)))
@@ -649,31 +699,32 @@ proc run*(vm: var VM): InterpretResult =
       vm.output.add(strOutput & "\n")
 
     of opJumpIfFalse:
-      let offset = int(frame.readShort())
+      let offset = int(readShort())
       if not isTruthy(vm.peek(0)):
-        frame.ip += offset
+        ip += offset
 
     of opJump:
-      let offset = int(frame.readShort())
-      frame.ip += offset
+      let offset = int(readShort())
+      ip += offset
 
     of opLoop:
-      let offset = int(frame.readShort())
-      frame.ip -= offset
+      let offset = int(readShort())
+      ip -= offset
 
     of opCall:
-      let argCount = int(frame.readByte())
+      let argCount = int(readByte())
+      syncFrame()
       if not vm.callValue(vm.peek(argCount), argCount):
         return irRuntimeError
-      frame = addr vm.frames[vm.frameCount - 1]
+      loadFrame()
 
     of opClosure:
-      let fn = asObjFunction(frame.readConstant())
+      let fn = asObjFunction(readConstant())
       let closure = vm.newClosure(fn)
       vm.push(valObj(closure))
       for i in 0 ..< closure.upvalueCount:
-        let isLocal = frame.readByte() == 1'u8
-        let index = int(frame.readByte())
+        let isLocal = readByte() == 1'u8
+        let index = int(readByte())
         if isLocal:
           closure.upvalues[i] = vm.captureUpvalue(addr vm.stack[frame.slots + index])
         else:
@@ -684,7 +735,7 @@ proc run*(vm: var VM): InterpretResult =
       discard vm.pop()
 
     of opBuildArray:
-      let count = int(frame.readByte())
+      let count = int(readByte())
       let arrObj = cast[ptr ObjArray](alloc0(sizeof(ObjArray)))
       arrObj.header = ObjHeader(kind: objArray)
       arrObj.elements = newSeq[Value](count)
@@ -697,11 +748,13 @@ proc run*(vm: var VM): InterpretResult =
       let indexVal = vm.pop()
       let containerVal = vm.pop()
       if not isNum(indexVal) or not isObjKind(containerVal, objArray):
+        syncFrame()
         vm.runtimeError("Subscript index must be a number on an array.")
         return irRuntimeError
       let idx = int(asNum(indexVal))
       let arr = cast[ptr ObjArray](asObj(containerVal))
       if idx < 0 or idx >= arr.elements.len:
+        syncFrame()
         vm.runtimeError("Array index out of bounds: " & $idx)
         return irRuntimeError
       vm.push(arr.elements[idx])
@@ -711,11 +764,13 @@ proc run*(vm: var VM): InterpretResult =
       let indexVal = vm.pop()
       let containerVal = vm.pop()
       if not isNum(indexVal) or not isObjKind(containerVal, objArray):
+        syncFrame()
         vm.runtimeError("Subscript index must be a number on an array.")
         return irRuntimeError
       let idx = int(asNum(indexVal))
       let arr = cast[ptr ObjArray](asObj(containerVal))
       if idx < 0 or idx >= arr.elements.len:
+        syncFrame()
         vm.runtimeError("Array index out of bounds: " & $idx)
         return irRuntimeError
       arr.elements[idx] = val
@@ -732,7 +787,7 @@ proc run*(vm: var VM): InterpretResult =
 
       vm.stackTop = frame.slots
       vm.push(resVal)
-      frame = addr vm.frames[vm.frameCount - 1]
+      loadFrame()
 
 proc interpret*(vm: var VM, source: string): InterpretResult =
   vm.isCompiling = true
