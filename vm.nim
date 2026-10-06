@@ -555,71 +555,81 @@ proc run*(vm: var VM): InterpretResult =
       discard vm.globals.tableSet(nameObj, vm.peek(0))
 
     of opEqual:
-      let b = vm.pop()
-      let a = vm.pop()
-      vm.push(valBool(valuesEqual(a, b)))
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
+      vm.stack[vm.stackTop - 1] = valBool(valuesEqual(a, b))
 
     of opGreater:
-      let b = vm.pop()
-      let a = vm.pop()
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.push(valBool(asNum(a) > asNum(b)))
+        vm.stack[vm.stackTop - 1] = valBool(asNum(a) > asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.push(valBool(getString(asObjString(a)) > getString(asObjString(b))))
+        vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) > getString(asObjString(b)))
       else:
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
     of opLess:
-      let b = vm.pop()
-      let a = vm.pop()
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.push(valBool(asNum(a) < asNum(b)))
+        vm.stack[vm.stackTop - 1] = valBool(asNum(a) < asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.push(valBool(getString(asObjString(a)) < getString(asObjString(b))))
+        vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) < getString(asObjString(b)))
       else:
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
     of opAdd:
-      let b = vm.pop()
-      let a = vm.pop()
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.push(valNum(asNum(a) + asNum(b)))
+        vm.stack[vm.stackTop - 1] = valNum(asNum(a) + asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
         let concatStr = getString(asObjString(a)) & getString(asObjString(b))
         let strVal = internStringImpl(addr vm, concatStr)
-        vm.push(strVal)
+        vm.stack[vm.stackTop - 1] = strVal
       else:
         vm.runtimeError("Operands must be numbers or strings.")
         return irRuntimeError
 
     of opSubtract:
-      let b = vm.pop()
-      let a = vm.pop()
-      if not isNum(a) or not isNum(b):
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
+      if isNum(a) and isNum(b):
+        vm.stack[vm.stackTop - 1] = valNum(asNum(a) - asNum(b))
+      else:
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
-      vm.push(valNum(asNum(a) - asNum(b)))
 
     of opMultiply:
-      let b = vm.pop()
-      let a = vm.pop()
-      if not isNum(a) or not isNum(b):
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
+      if isNum(a) and isNum(b):
+        vm.stack[vm.stackTop - 1] = valNum(asNum(a) * asNum(b))
+      else:
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
-      vm.push(valNum(asNum(a) * asNum(b)))
 
     of opDivide:
-      let b = vm.pop()
-      let a = vm.pop()
-      if not isNum(a) or not isNum(b):
+      dec vm.stackTop
+      let b = vm.stack[vm.stackTop]
+      let a = vm.stack[vm.stackTop - 1]
+      if isNum(a) and isNum(b):
+        if asNum(b) == 0.0:
+          vm.runtimeError("Division by zero.")
+          return irRuntimeError
+        vm.stack[vm.stackTop - 1] = valNum(asNum(a) / asNum(b))
+      else:
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
-      if asNum(b) == 0.0:
-        vm.runtimeError("Division by zero.")
-        return irRuntimeError
-      vm.push(valNum(asNum(a) / asNum(b)))
 
     of opNot:
       let val = vm.pop()

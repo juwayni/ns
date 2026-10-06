@@ -1,4 +1,4 @@
-## compiler.nim - Flexible-Array ObjString, Arrays, Lexical Closures & Pratt Parser
+## compiler.nim - Flexible-Array Single-Allocation ObjString, Lexical Closures & Pratt Parser
 
 import lexer
 
@@ -59,7 +59,7 @@ type
 template chars*(strObj: ptr ObjString): cstring =
   cast[cstring](cast[uint](strObj) + sizeof(ObjString).uint)
 
-proc getString*(strObj: ptr ObjString): string =
+proc getString*(strObj: ptr ObjString): string {.inline.} =
   if strObj == nil or strObj.length == 0: return ""
   return $chars(strObj)
 
@@ -105,37 +105,37 @@ type
     finalizer*: proc(p: pointer) {.nimcall.}
     data*: pointer
 
-proc isObjKind*(v: Value, kind: ObjKind): bool =
+proc isObjKind*(v: Value, kind: ObjKind): bool {.inline.} =
   if not isObj(v): return false
   let ptrHeader = cast[ptr ObjHeader](asObj(v))
   if ptrHeader == nil: return false
   return ptrHeader.kind == kind
 
-proc asObjString*(v: Value): ptr ObjString =
+proc asObjString*(v: Value): ptr ObjString {.inline.} =
   cast[ptr ObjString](asObj(v))
 
-proc asObjFunction*(v: Value): ptr ObjFunction =
+proc asObjFunction*(v: Value): ptr ObjFunction {.inline.} =
   cast[ptr ObjFunction](asObj(v))
 
-proc asObjClosure*(v: Value): ptr ObjClosure =
+proc asObjClosure*(v: Value): ptr ObjClosure {.inline.} =
   cast[ptr ObjClosure](asObj(v))
 
-proc asObjUpvalue*(v: Value): ptr ObjUpvalue =
+proc asObjUpvalue*(v: Value): ptr ObjUpvalue {.inline.} =
   cast[ptr ObjUpvalue](asObj(v))
 
-proc asObjArray*(v: Value): ptr ObjArray =
+proc asObjArray*(v: Value): ptr ObjArray {.inline.} =
   cast[ptr ObjArray](asObj(v))
 
-proc asObjNative*(v: Value): ptr ObjNative =
+proc asObjNative*(v: Value): ptr ObjNative {.inline.} =
   cast[ptr ObjNative](asObj(v))
 
-proc asObjUserData*(v: Value): ptr ObjUserData =
+proc asObjUserData*(v: Value): ptr ObjUserData {.inline.} =
   cast[ptr ObjUserData](asObj(v))
 
-proc `==`*(a, b: Value): bool =
+proc `==`*(a, b: Value): bool {.inline.} =
   uint64(a) == uint64(b)
 
-proc valuesEqual*(a, b: Value): bool =
+proc valuesEqual*(a, b: Value): bool {.inline.} =
   if isNum(a) and isNum(b): return asNum(a) == asNum(b)
   if isObjKind(a, objString) and isObjKind(b, objString):
     return asObj(a) == asObj(b)
@@ -273,22 +273,22 @@ type
     hadError*: bool
     panicMode*: bool
 
-proc currentChunk*(compiler: var Compiler): ptr Chunk =
+proc currentChunk*(compiler: var Compiler): ptr Chunk {.inline.} =
   addr compiler.function.chunk
 
-proc emitByte*(compiler: var Compiler, byteVal: uint8) =
+proc emitByte*(compiler: var Compiler, byteVal: uint8) {.inline.} =
   let chunk = compiler.currentChunk()
   chunk.code.add(byteVal)
   chunk.lines.add(compiler.previous.line)
 
-proc emitOp*(compiler: var Compiler, op: OpCode) =
+proc emitOp*(compiler: var Compiler, op: OpCode) {.inline.} =
   compiler.emitByte(uint8(ord(op)))
 
-proc emitBytes*(compiler: var Compiler, byte1, byte2: uint8) =
+proc emitBytes*(compiler: var Compiler, byte1, byte2: uint8) {.inline.} =
   compiler.emitByte(byte1)
   compiler.emitByte(byte2)
 
-proc emitOpAndByte*(compiler: var Compiler, op: OpCode, byteVal: uint8) =
+proc emitOpAndByte*(compiler: var Compiler, op: OpCode, byteVal: uint8) {.inline.} =
   compiler.emitOp(op)
   compiler.emitByte(byteVal)
 
@@ -390,10 +390,10 @@ proc consume*(compiler: var Compiler, kind: TokenType, message: string) =
     return
   compiler.errorAtCurrent(message)
 
-proc check*(compiler: Compiler, kind: TokenType): bool =
+proc check*(compiler: Compiler, kind: TokenType): bool {.inline.} =
   compiler.current.kind == kind
 
-proc match*(compiler: var Compiler, kind: TokenType): bool =
+proc match*(compiler: var Compiler, kind: TokenType): bool {.inline.} =
   if not compiler.check(kind): return false
   compiler.advance()
   return true
