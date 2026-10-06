@@ -1,4 +1,4 @@
-## vm.nim - High-Performance CallFrame, Computed-Goto, FlatTable & Mark-Sweep VM
+## vm.nim - High-Performance CallFrame, Computed-Goto, FlatTable, Register-Cached & Mark-Sweep VM
 
 import compiler
 
@@ -473,17 +473,29 @@ proc run*(vm: var VM): InterpretResult =
   let targetFrameCount = vm.frameCount - 1
   var frame = addr vm.frames[vm.frameCount - 1]
   var ip = frame.ip
+  var stackTop = vm.stackTop
+  let stackPtr = cast[ptr UncheckedArray[Value]](addr vm.stack[0])
   var codePtr = if frame.closure.function.chunk.code.len > 0: cast[ptr UncheckedArray[uint8]](addr frame.closure.function.chunk.code[0]) else: nil
   var constantsPtr = if frame.closure.function.chunk.constants.len > 0: cast[ptr UncheckedArray[Value]](addr frame.closure.function.chunk.constants[0]) else: nil
 
   template syncFrame() =
     frame.ip = ip
+    vm.stackTop = stackTop
 
   template loadFrame() =
     frame = addr vm.frames[vm.frameCount - 1]
     ip = frame.ip
+    stackTop = vm.stackTop
     codePtr = if frame.closure.function.chunk.code.len > 0: cast[ptr UncheckedArray[uint8]](addr frame.closure.function.chunk.code[0]) else: nil
     constantsPtr = if frame.closure.function.chunk.constants.len > 0: cast[ptr UncheckedArray[Value]](addr frame.closure.function.chunk.constants[0]) else: nil
+
+  template pushVal(v: Value) =
+    stackPtr[stackTop] = v
+    inc stackTop
+
+  template popVal(): Value =
+    dec stackTop
+    stackPtr[stackTop]
 
   template readByte(): uint8 =
     let b = codePtr[ip]
@@ -508,47 +520,47 @@ proc run*(vm: var VM): InterpretResult =
     case instruction
     of opConstant:
       let constant = readConstant()
-      vm.push(constant)
+      pushVal(constant)
 
     of opNil:
-      vm.push(valNil())
+      pushVal(valNil())
 
     of opTrue:
-      vm.push(valBool(true))
+      pushVal(valBool(true))
 
     of opFalse:
-      vm.push(valBool(false))
+      pushVal(valBool(false))
 
     of opPop:
-      discard vm.pop()
+      discard popVal()
 
     of opGetLocal:
       let slot = readByte()
-      vm.push(vm.stack[frame.slots + int(slot)])
+      pushVal(stackPtr[frame.slots + int(slot)])
 
     of opSetLocal:
       let slot = readByte()
-      vm.stack[frame.slots + int(slot)] = vm.peek(0)
+      stackPtr[frame.slots + int(slot)] = stackPtr[stackTop - 1]
 
     of opGetLocal0..opGetLocal3:
       let slot = int(instruction) - int(opGetLocal0)
-      vm.push(vm.stack[frame.slots + slot])
+      pushVal(stackPtr[frame.slots + slot])
 
     of opSetLocal0..opSetLocal3:
       let slot = int(instruction) - int(opSetLocal0)
-      vm.stack[frame.slots + slot] = vm.peek(0)
+      stackPtr[frame.slots + slot] = stackPtr[stackTop - 1]
 
     of opGetUpvalue:
       let slot = readByte()
-      vm.push(frame.closure.upvalues[slot].location[])
+      pushVal(frame.closure.upvalues[slot].location[])
 
     of opSetUpvalue:
       let slot = readByte()
-      frame.closure.upvalues[slot].location[] = vm.peek(0)
+      frame.closure.upvalues[slot].location[] = stackPtr[stackTop - 1]
 
     of opDefineGlobal:
       let nameObj = readString()
-      discard vm.globals.tableSet(nameObj, vm.pop())
+      discard vm.globals.tableSet(nameObj, popVal())
 
     of opGetGlobal:
       let nameObj = readString()
@@ -557,7 +569,7 @@ proc run*(vm: var VM): InterpretResult =
         syncFrame()
         vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
-      vm.push(val)
+      pushVal(val)
 
     of opSetGlobal:
       let nameObj = readString()
@@ -566,46 +578,46 @@ proc run*(vm: var VM): InterpretResult =
         syncFrame()
         vm.runtimeError("Undefined variable '" & getString(nameObj) & "'.")
         return irRuntimeError
-      discard vm.globals.tableSet(nameObj, vm.peek(0))
+      discard vm.globals.tableSet(nameObj, stackPtr[stackTop - 1])
 
     of opEqual:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
-      vm.stack[vm.stackTop - 1] = valBool(valuesEqual(a, b))
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
+      stackPtr[stackTop - 1] = valBool(valuesEqual(a, b))
 
     of opGreater:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.stack[vm.stackTop - 1] = valBool(asNum(a) > asNum(b))
+        stackPtr[stackTop - 1] = valBool(asNum(a) > asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) > getString(asObjString(b)))
+        stackPtr[stackTop - 1] = valBool(getString(asObjString(a)) > getString(asObjString(b)))
       else:
         syncFrame()
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
     of opLess:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.stack[vm.stackTop - 1] = valBool(asNum(a) < asNum(b))
+        stackPtr[stackTop - 1] = valBool(asNum(a) < asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
-        vm.stack[vm.stackTop - 1] = valBool(getString(asObjString(a)) < getString(asObjString(b)))
+        stackPtr[stackTop - 1] = valBool(getString(asObjString(a)) < getString(asObjString(b)))
       else:
         syncFrame()
         vm.runtimeError("Operands must be two numbers or two strings.")
         return irRuntimeError
 
     of opAdd:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.stack[vm.stackTop - 1] = valNum(asNum(a) + asNum(b))
+        stackPtr[stackTop - 1] = valNum(asNum(a) + asNum(b))
       elif isObjKind(a, objString) and isObjKind(b, objString):
         let strA = asObjString(a)
         let strB = asObjString(b)
@@ -629,78 +641,78 @@ proc run*(vm: var VM): InterpretResult =
           let entry = findEntry(vm.strings.entries, vm.strings.capacityMask, newStrObj)
           if entry.key != nil:
             dealloc(newStrObj)
-            vm.stack[vm.stackTop - 1] = valObj(entry.key)
+            stackPtr[stackTop - 1] = valObj(entry.key)
           else:
             discard vm.strings.tableSet(newStrObj, valBool(true))
             vm.trackObject(cast[pointer](newStrObj))
-            vm.stack[vm.stackTop - 1] = valObj(newStrObj)
+            stackPtr[stackTop - 1] = valObj(newStrObj)
         else:
           discard vm.strings.tableSet(newStrObj, valBool(true))
           vm.trackObject(cast[pointer](newStrObj))
-          vm.stack[vm.stackTop - 1] = valObj(newStrObj)
+          stackPtr[stackTop - 1] = valObj(newStrObj)
       else:
         syncFrame()
         vm.runtimeError("Operands must be numbers or strings.")
         return irRuntimeError
 
     of opSubtract:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.stack[vm.stackTop - 1] = valNum(asNum(a) - asNum(b))
+        stackPtr[stackTop - 1] = valNum(asNum(a) - asNum(b))
       else:
         syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
     of opMultiply:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
-        vm.stack[vm.stackTop - 1] = valNum(asNum(a) * asNum(b))
+        stackPtr[stackTop - 1] = valNum(asNum(a) * asNum(b))
       else:
         syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
     of opDivide:
-      dec vm.stackTop
-      let b = vm.stack[vm.stackTop]
-      let a = vm.stack[vm.stackTop - 1]
+      dec stackTop
+      let b = stackPtr[stackTop]
+      let a = stackPtr[stackTop - 1]
       if isNum(a) and isNum(b):
         if asNum(b) == 0.0:
           syncFrame()
           vm.runtimeError("Division by zero.")
           return irRuntimeError
-        vm.stack[vm.stackTop - 1] = valNum(asNum(a) / asNum(b))
+        stackPtr[stackTop - 1] = valNum(asNum(a) / asNum(b))
       else:
         syncFrame()
         vm.runtimeError("Operands must be numbers.")
         return irRuntimeError
 
     of opNot:
-      let val = vm.pop()
-      vm.push(valBool(not isTruthy(val)))
+      let val = popVal()
+      pushVal(valBool(not isTruthy(val)))
 
     of opNegate:
-      let val = vm.pop()
+      let val = popVal()
       if not isNum(val):
         syncFrame()
         vm.runtimeError("Operand must be a number.")
         return irRuntimeError
-      vm.push(valNum(-asNum(val)))
+      pushVal(valNum(-asNum(val)))
 
     of opPrint:
-      let val = vm.pop()
+      let val = popVal()
       let strOutput = $val
       echo strOutput
       vm.output.add(strOutput & "\n")
 
     of opJumpIfFalse:
       let offset = int(readShort())
-      if not isTruthy(vm.peek(0)):
+      if not isTruthy(stackPtr[stackTop - 1]):
         ip += offset
 
     of opJump:
@@ -714,14 +726,15 @@ proc run*(vm: var VM): InterpretResult =
     of opCall:
       let argCount = int(readByte())
       syncFrame()
-      if not vm.callValue(vm.peek(argCount), argCount):
+      if not vm.callValue(stackPtr[stackTop - 1 - argCount], argCount):
         return irRuntimeError
       loadFrame()
 
     of opClosure:
       let fn = asObjFunction(readConstant())
+      syncFrame()
       let closure = vm.newClosure(fn)
-      vm.push(valObj(closure))
+      pushVal(valObj(closure))
       for i in 0 ..< closure.upvalueCount:
         let isLocal = readByte() == 1'u8
         let index = int(readByte())
@@ -731,22 +744,24 @@ proc run*(vm: var VM): InterpretResult =
           closure.upvalues[i] = frame.closure.upvalues[index]
 
     of opCloseUpvalue:
-      vm.closeUpvalues(addr vm.stack[vm.stackTop - 1])
-      discard vm.pop()
+      syncFrame()
+      vm.closeUpvalues(addr vm.stack[stackTop - 1])
+      discard popVal()
 
     of opBuildArray:
       let count = int(readByte())
+      syncFrame()
       let arrObj = cast[ptr ObjArray](alloc0(sizeof(ObjArray)))
       arrObj.header = ObjHeader(kind: objArray)
       arrObj.elements = newSeq[Value](count)
       for i in countdown(count - 1, 0):
-        arrObj.elements[i] = vm.pop()
+        arrObj.elements[i] = popVal()
       vm.trackObject(cast[pointer](arrObj))
-      vm.push(valObj(arrObj))
+      pushVal(valObj(arrObj))
 
     of opGetIndex:
-      let indexVal = vm.pop()
-      let containerVal = vm.pop()
+      let indexVal = popVal()
+      let containerVal = popVal()
       if not isNum(indexVal) or not isObjKind(containerVal, objArray):
         syncFrame()
         vm.runtimeError("Subscript index must be a number on an array.")
@@ -757,12 +772,12 @@ proc run*(vm: var VM): InterpretResult =
         syncFrame()
         vm.runtimeError("Array index out of bounds: " & $idx)
         return irRuntimeError
-      vm.push(arr.elements[idx])
+      pushVal(arr.elements[idx])
 
     of opSetIndex:
-      let val = vm.pop()
-      let indexVal = vm.pop()
-      let containerVal = vm.pop()
+      let val = popVal()
+      let indexVal = popVal()
+      let containerVal = popVal()
       if not isNum(indexVal) or not isObjKind(containerVal, objArray):
         syncFrame()
         vm.runtimeError("Subscript index must be a number on an array.")
@@ -774,10 +789,11 @@ proc run*(vm: var VM): InterpretResult =
         vm.runtimeError("Array index out of bounds: " & $idx)
         return irRuntimeError
       arr.elements[idx] = val
-      vm.push(val)
+      pushVal(val)
 
     of opReturn:
-      let resVal = vm.pop()
+      let resVal = popVal()
+      syncFrame()
       vm.closeUpvalues(addr vm.stack[frame.slots])
       dec vm.frameCount
       if vm.frameCount == targetFrameCount:
